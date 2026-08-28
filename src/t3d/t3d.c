@@ -4,6 +4,7 @@
 */
 #include <t3d/t3d.h>
 #include "rsp/rsp_tiny3d.h"
+#include "rsp/rsp_tinylines.h"
 #include <rspq_profile.h>
 
 #ifndef RDPQ_WRITE_COUNT_UNKNOWN
@@ -37,7 +38,42 @@ static_assert(RSP_T3D_CODE_TAG_CullFlipB < RSP_T3D_CODE_CLIPPING_CODE_TARGET, "C
 
 DEFINE_RSP_UCODE(rsp_tiny3d);
 DEFINE_RSP_UCODE(rsp_tiny3d_clipping);
+DEFINE_RSP_UCODE(rsp_tinylines);
 uint32_t T3D_RSP_ID = 0;
+
+// The wireframe ucode replaces tiny3d under the same overlay-id, so every DMEM
+// address that gets baked into a command (or a recorded display-list) has to
+// resolve identically in both. Keep this list in sync with the state section of
+// 'rsp_tinylines.rspl'.
+#define T3D_ASSERT_SAME_ADDR(name) \
+  static_assert(RSP_T3D_##name == RSP_TLN_##name, "Wireframe ucode DMEM layout differs: " #name)
+
+T3D_ASSERT_SAME_ADDR(STATE_MEM_START);
+T3D_ASSERT_SAME_ADDR(STATE_MEM_END);
+T3D_ASSERT_SAME_ADDR(MATRIX_PROJ);
+T3D_ASSERT_SAME_ADDR(MATRIX_MVP);
+T3D_ASSERT_SAME_ADDR(MATRIX_MV);
+T3D_ASSERT_SAME_ADDR(SCREEN_SCALE_OFFSET);
+T3D_ASSERT_SAME_ADDR(CLIPPING_PLANES);
+T3D_ASSERT_SAME_ADDR(SCREEN_UVGEN_SCALE);
+T3D_ASSERT_SAME_ADDR(NORM_SCALE_W);
+T3D_ASSERT_SAME_ADDR(UV_GEN_PARAMS);
+T3D_ASSERT_SAME_ADDR(COLOR_EXPOSURE);
+T3D_ASSERT_SAME_ADDR(SEGMENT_TABLE);
+T3D_ASSERT_SAME_ADDR(COLOR_AMBIENT);
+T3D_ASSERT_SAME_ADDR(LIGHT_DIR_COLOR);
+T3D_ASSERT_SAME_ADDR(TRI_COMMAND);
+T3D_ASSERT_SAME_ADDR(MATRIX_STACK_PTR);
+T3D_ASSERT_SAME_ADDR(FACE_CULLING);
+T3D_ASSERT_SAME_ADDR(FOG_STORE_OFFSET);
+T3D_ASSERT_SAME_ADDR(ACTIVE_LIGHT_SIZE);
+T3D_ASSERT_SAME_ADDR(VERTEX_FX_FUNC);
+T3D_ASSERT_SAME_ADDR(CLIP_CODE_ORG_ADDR);
+T3D_ASSERT_SAME_ADDR(VERT_BUFFER);
+static_assert(RSP_T3D_BSS_CLIP_BUFFER_TMP == RSP_TLN_BSS_RDP_BUFF,
+  "Wireframe RDP buffer must cover the region 't3d_vert_load' DMAs into");
+// the line settings alias tiny3d's normal matrix, which the wireframe ucode never writes
+static_assert(RSP_T3D_MATRIX_NORMAL == RSP_TLN_LINE_COLOR_KEEP, "Line settings moved out of the spare block");
 
 #define MAX(a,b) (a) > (b) ? (a) : (b)
 #define MIN(a,b) (a) < (b) ? (a) : (b)
@@ -469,6 +505,102 @@ void t3d_state_set_cull_invert(bool invert)
   t3d_imem_patch_instr(RSP_T3D_CODE_TAG_CullFlipB, orgInstrCullFlipB,
     invert ? (orgB & ~1u) : orgB // clears the immediate, turning the `xori` into a no-op
   );
+}
+
+// ---- Wireframe mode -------------------------------------------------------
+
+static bool wireframeEnabled = false;
+static uint16_t wireframeWidth = 4;                        // x 1/4 pixels
+static uint32_t wireframeColorKeep[2] = {0xFFFFFFFF, 0xFFFFFFFF};
+static uint32_t wireframeColorSet[2] = {0, 0};
+static uint16_t wireframeForceComb = 0;                    // only for a flat color
+
+// The ucode prepends a SET_COMBINE carrying this value to a line batch when the
+// flat color override is on, so the color survives whatever combiner the
+// display-list installed. It is baked into 'rsp_tinylines.rspl' as
+// RDP_SET_COMB_HI/LO; if rdpq ever changes the encoding this catches it at
+// build time instead of on screen.
+static_assert(RDPQ_COMBINER_SHADE == 0x00887f1088fe793cull,
+  "RDPQ_COMBINER_SHADE changed, update RDP_SET_COMB_HI/LO in rsp_tinylines.rspl");
+
+// the ucode loads colors with 'luv', which places each byte in bits 14..7
+static uint32_t t3d_wireframe_pack_color(uint8_t hi, uint8_t lo) {
+  return ((uint32_t)hi << 23) | ((uint32_t)lo << 7);
+}
+
+static void t3d_wireframe_upload_settings(void) {
+  t3d_dmem_set_u32((RSP_TLN_LINE_COLOR_KEEP & 0xFFF) + 0, wireframeColorKeep[0]);
+  t3d_dmem_set_u32((RSP_TLN_LINE_COLOR_KEEP & 0xFFF) + 4, wireframeColorKeep[1]);
+  t3d_dmem_set_u32((RSP_TLN_LINE_COLOR_SET & 0xFFF) + 0, wireframeColorSet[0]);
+  t3d_dmem_set_u32((RSP_TLN_LINE_COLOR_SET & 0xFFF) + 4, wireframeColorSet[1]);
+  t3d_dmem_set_u16((RSP_TLN_LINE_WIDTH & 0xFFF), wireframeWidth);
+  t3d_dmem_set_u16((RSP_TLN_LINE_COMB_FORCE & 0xFFF), wireframeForceComb);
+  t3d_dmem_set_u16((RSP_TLN_LINE_COMB_DIRTY & 0xFFF), wireframeForceComb);
+}
+
+void t3d_wireframe_set(bool enabled)
+{
+  assertf(T3D_RSP_ID != 0, "t3d_init must be called first!");
+  if(enabled == wireframeEnabled)return;
+  wireframeEnabled = enabled;
+
+  // Swapping which ucode answers to T3D_RSP_ID rewrites ucode headers on the CPU
+  // side, so nothing referring to them may still be in flight.
+  rspq_wait();
+
+  rspq_overlay_unregister(T3D_RSP_ID);
+  if(enabled) {
+    rspq_overlay_register_static(&rsp_tinylines, T3D_RSP_ID);
+    // Registering resets 'state_rdram', so the state has to be re-shared every
+    // time. Sharing means matrices, screen size, segments and the matrix stack
+    // pointer carry over between the two ucodes without any re-initialization.
+    rspq_overlay_share_state(&rsp_tinylines, &rsp_tiny3d);
+    // The line settings live in the space tiny3d uses for its normal matrix, so
+    // they have to be restored after tiny3d had the state.
+    t3d_wireframe_upload_settings();
+  } else {
+    rspq_overlay_register_static(&rsp_tiny3d, T3D_RSP_ID);
+    // tiny3d's normal matrix lives where the line settings were, so clear it.
+    // The next matrix command recomputes it; until then lighting is ambient-only
+    // instead of reacting to leftover values.
+    for(uint32_t i = 0; i < 24; i += 4) {
+      t3d_dmem_set_u32((RSP_T3D_MATRIX_NORMAL & 0xFFF) + i, 0);
+    }
+  }
+}
+
+bool t3d_wireframe_get(void) {
+  return wireframeEnabled;
+}
+
+void t3d_wireframe_set_color(color_t color)
+{
+  wireframeColorKeep[0] = 0;
+  wireframeColorKeep[1] = 0;
+  wireframeColorSet[0] = t3d_wireframe_pack_color(color.r, color.g);
+  wireframeColorSet[1] = t3d_wireframe_pack_color(color.b, color.a);
+  wireframeForceComb = 1;
+  if(wireframeEnabled)t3d_wireframe_upload_settings();
+}
+
+void t3d_wireframe_use_vertex_color(void)
+{
+  wireframeColorKeep[0] = 0xFFFFFFFF;
+  wireframeColorKeep[1] = 0xFFFFFFFF;
+  wireframeColorSet[0] = 0;
+  wireframeColorSet[1] = 0;
+  wireframeForceComb = 0;
+  if(wireframeEnabled)t3d_wireframe_upload_settings();
+}
+
+void t3d_wireframe_set_width(float width)
+{
+  // the ucode also uses this as the minimum vertical extent of a line, which has
+  // to stay at or above one full scanline
+  if(width < 1.0f)width = 1.0f;
+  if(width > 63.0f)width = 63.0f;
+  wireframeWidth = (uint16_t)(width * 4.0f + 0.5f);
+  if(wireframeEnabled)t3d_wireframe_upload_settings();
 }
 
 void t3d_segment_set(uint8_t segmentId, void *address) {

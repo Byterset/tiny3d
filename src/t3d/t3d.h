@@ -474,6 +474,66 @@ void t3d_matrix_set_proj(const T3DMat4FP *mat);
 void t3d_vert_load(const T3DVertPacked *vertices, uint32_t offset, uint32_t count);
 
 /**
+ * Switches all following draw calls between filled triangles and wireframe.
+ *
+ * Wireframe mode swaps in a second ucode that renders every triangle as three
+ * lines instead of a filled surface. Because it takes over the same commands,
+ * this also applies to display-lists (rspq blocks) that were recorded earlier,
+ * so nothing has to be re-recorded to switch between modes.
+ *
+ * Lines are depth-tested and use the vertex color, which is plain white for
+ * models that don't carry vertex colors. Backface culling is not applied.
+ *
+ * Note that this performs a full RSP sync, so it is best to be toggled on
+ * user input or per frame, not in the middle of drawing a scene.
+ *
+ * Textures and UVs are ignored, so a line only ever gets the material's color
+ * combiner applied to its shade value. With vertex colors that keeps the model's
+ * look; otherwise 't3d_wireframe_set_color' can be used to set a flat color
+ * which will override the materials combiner as well.
+ *
+ * One limitation compared to filled rendering: lines are never clipped, so an
+ * edge leaving the guard band (or crossing the near plane) is dropped entirely.
+ *
+ * @param enabled true to draw wireframes, false for normal rendering
+ */
+void t3d_wireframe_set(bool enabled);
+
+/**
+ * @return true if wireframe rendering is currently active
+ */
+bool t3d_wireframe_get(void);
+
+/**
+ * Draws all wireframe lines in a single flat color instead of the vertex color.
+ *
+ * This wins over any material in a recorded display-list, textured or not.
+ * The ucode installs its own shade-only color combiner ahead of each batch of lines,
+ * so nothing the material set up can swallow the color.
+ * @param color line color
+ */
+void t3d_wireframe_set_color(color_t color);
+
+/**
+ * Goes back to using the vertex color for wireframe lines (default).
+ *
+ * This also stops overriding the color combiner, so materials in a recorded
+ * display-list keep their effect on the lines. The material's own combiner is
+ * back in force from the next time the display-list installs it, which for a
+ * block that is re-run every frame means the frame after the switch.
+ */
+void t3d_wireframe_use_vertex_color(void);
+
+/**
+ * Sets the thickness of wireframe lines.
+ * This is also the minimum vertical extent, so a horizontal line comes out as
+ * thick as a vertical one.
+ * @param width width in pixels, quantized to 1/4 pixel, clamped to 1.0 or more
+ *              (default: 1.0)
+ */
+void t3d_wireframe_set_width(float width);
+
+/**
  * Sets the global ambient light color.
  * This color is always active and applied to all objects.
  * To disable the ambient light, set the color to black.

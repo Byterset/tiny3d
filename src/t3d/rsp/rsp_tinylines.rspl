@@ -1,0 +1,1090 @@
+/***************************************
+ *   Wireframe ucode for libdragon     *
+ *                                     *
+ * Drop-in replacement for tiny3d that *
+ * draws every triangle as three lines *
+ * instead of a filled surface.        *
+ *                                     *
+ * @license MIT                        *
+ ***************************************/
+
+// NOTE: This runs under tiny3d's overlay-id, so display-lists recorded for tiny3d end up
+// here. Every DMEM address baked into those commands has to land in the same place,
+// which means the 'state' block below must match 'rsp_tiny3d.rspl' byte for byte.
+// 't3d.c' static_asserts the addresses that are actually used.
+
+// must match tiny3d
+#define RSPQ_PROFILE_MANUAL_SLOT 1
+
+#define VERT_BUFFER_COUNT 70
+#define LIGHT_COUNT 7
+#define LIGHT_SIZE 16
+
+#define VTX_ATTR_XY          0x00
+#define VTX_ATTR_Z           0x04
+#define VTX_ATTR_CLIPFLAGS   0x06
+#define VTX_ATTR_REJFLAGS    0x07
+#define VTX_ATTR_RGBA        0x08
+#define VTX_ATTR_ST          0x0C
+#define VTX_ATTR_CLIPPOSi    0x10
+#define VTX_ATTR_Wi          0x16
+#define VTX_ATTR_CLIPPOSf    0x18
+#define VTX_ATTR_Wf          0x1E
+#define VTX_ATTR_INVWi       0x20
+#define VTX_ATTR_INVWf       0x22
+
+#define TRI_SIZE   36
+#define TRI_SIZE_2 72
+#define TRI_SIZE_3 108
+
+// One RDP triangle command: 8 words edge + 16 words shade + 4 words depth
+#define LINE_CMD_SIZE 112
+#define LINE_CMD_SIZE_2 224
+#define LINE_CMD_SIZE_3 336
+
+// triangle (0x08) | shade (0x04) | z-buffer (0x01), shifted into place, with the
+// "left major" flag (bit 23) set.
+#define RDP_CMD_LINE 0x0D80'0000
+
+// SYNC_PIPE (0x27) + SET_COMBINE (0x3C) with 'RDPQ_COMBINER_SHADE', prepended to a
+// line batch to take the combiner away from whatever the display-list set up. The
+// sync is there because the previous batch may still be using the old one.
+// 't3d.c' static_asserts these against rdpq's macro.
+#define RDP_SYNC_PIPE      0x2700'0000
+#define RDP_SET_COMB_HI    0x3C88'7F10
+#define RDP_SET_COMB_LO    0x88FE'793C
+#define LINE_HDR_SIZE      16
+
+include "rsp_queue.inc"
+include "rsp_rdpq.inc"
+include "rdpq_macros.h"
+
+
+state
+{
+  // external libdragon labels
+  extern u32 RDPQ_OTHER_MODES;
+  extern u16 RSPQ_Loop;
+  extern u16 RSPQ_SCRATCH_MEM;
+
+  alignas(8) vec16 MATRIX_PROJ[4];   // projection matrix
+  alignas(8) vec16 MATRIX_MVP[4];    // view * model * projection
+  alignas(8) vec16 MATRIX_MV[4];
+
+  // --- 24 bytes where tiny3d keeps 'MATRIX_NORMAL[3][4]', re-used for line settings ---
+  // 'color = (color & KEEP) | SET' at vertex-load time. Default keeps the vertex
+  // color, a flat override sets KEEP=0 and SET=<color>.
+  alignas(8) u16 LINE_COLOR_KEEP[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+  u16 LINE_COLOR_SET[4] = {0, 0, 0, 0};
+  u16 LINE_WIDTH = {6};      // in 1/4 pixels (6 = 1.5px, gspLine3D's minimum)
+  u16 LINE_COMB_FORCE = {0}; // force the shade-only combiner? only a flat color needs it,
+                             // vertex colors keep the material's own look
+  u16 LINE_COMB_DIRTY = {0}; // display-list may have changed the combiner. Copy of _FORCE,
+                             // cleared once a batch has forced it back
+  u16 LINE_SKIP_EDGE = {0};  // next (gV2 -> gV0) edge is a duplicate, see 'drawTriLines'
+  // --- end of the 24 byte block ---
+
+  s16 FOG_SCALE_OFFSET[4] = {0, 0, 32767, 0};
+
+  vec16 SCREEN_SCALE_OFFSET = {
+    0, 0, 0,           0,
+    0, 0, 0x3FFF, 0x00FF
+  };
+
+  vec16 NORMAL_MASK_SHIFT = {
+    0b11111'000000'00000,
+    0b00000'111111'00000,
+    0b00000'000000'11111,
+    0,
+    1, 32, 2048, 0
+  };
+
+  alignas(8) s8 CLIPPING_PLANES[5][4] = {
+     1, 0, 0,   1,
+     0, 1, 0,   1,
+     0, 0, 1,   1,
+     1, 0, 0,  -1,
+     0, 1, 0,  -1
+  };
+
+  u16 RDPQ_TRI_BUFF_OFFSET = {0};
+  u16 SCREEN_UVGEN_SCALE = {0};
+
+  alignas(8) s16 NORM_SCALE_W[4] = {
+    0xFFFF, 0xFFFF, 0xFFFF, 0x0000
+  };
+
+  u16 CLIP_RA = {0};
+  u16 UV_GEN_PARAMS[2] = {0, 0};
+  u16 COLOR_EXPOSURE = {0x80};
+  u32 SEGMENT_TABLE[8] = {0};
+
+  u32 COLOR_AMBIENT[2];
+  alignas(4) u8 LIGHT_DIR_COLOR[LIGHT_SIZE][LIGHT_COUNT];
+
+  u32 TRI_COMMAND = {0};
+  s32 MATRIX_STACK_PTR = {0};
+
+  u8 FACE_CULLING = {0};
+  u8 FOG_STORE_OFFSET = {TRI_SIZE_2};
+  u8 ACTIVE_LIGHT_SIZE = {0};
+  u8 _UNUSED_ = {0};
+
+  u16 VERTEX_FX_FUNC = {0};
+  u16 CLIP_CODE_SIZE = {0};
+
+  u32 CLIP_CODE_ADDR = {0};
+  u32 CLIP_CODE_ORG_ADDR = {0};
+
+  /**
+   * tiny3d's layout, but only the fields a line needs are filled in:
+   *
+   *   Type |     Name  | Offset
+   * -------+-----------+--------
+   * s16[2] | Pos-XY    | 0x00   (s13.2 screen space)
+   * s16    | Depth     | 0x04
+   * u8     | Clip-Code | 0x06
+   * u8     | Rej. Code | 0x07
+   * u8[4]  | Color     | 0x08
+   * s16[2] | UV        | 0x0C   (unused)
+   * s16[3] | Clip-Pos  | 0x10
+   * s16    | W         | 0x16
+   * f16[3] | Clip-Pos  | 0x18
+   * f16    | W         | 0x1E
+   * s16.16 | InvW      | 0x20
+   * -------+-----------+-0x24---
+   */
+  alignas(8)
+  u8 VERT_BUFFER[VERT_BUFFER_COUNT][TRI_SIZE];
+}
+
+temp_state {
+  // tiny3d's 544 bytes of clipping buffers. Doubles as the RDP command buffer while
+  // triangles are turned into lines, vertex DMA and line output never overlap in time.
+  alignas(16)
+  u8 RDP_BUFF[544];
+}
+
+#include "inc/math.rspl"
+
+function RDPQ_Send(u16<$s4> dmemStart, u16<$s3> dmaDmemEnd);
+function DMAOut(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
+
+
+macro packClipCode(u32 res, u32 clipCode)
+{
+  res = clipCode & 0b0000'0011'0000'0111;
+  u32 tmp = res >> 5;
+  res |= tmp;
+}
+
+macro loadCurrentMVPMat(vec32 mat0, vec32 mat1, vec32 mat2, vec32 mat3)
+{
+  mat0 = load(MATRIX_MVP, 0x00).xyzwxyzw;
+  mat1 = load(MATRIX_MVP, 0x10).xyzwxyzw;
+  mat2 = load(MATRIX_MVP, 0x20).xyzwxyzw;
+  mat3 = load(MATRIX_MVP, 0x30).xyzwxyzw;
+}
+
+macro resolveSegmentAddr(u32 addrOut, u32 addrIn) {
+  u32 segment = addrIn >> 24;
+  segment = load(segment, SEGMENT_TABLE);
+  addrOut = addrIn + segment;
+}
+
+/**
+ * Loads & transforms vertices. tiny3d's 'T3DCmd_VertLoad' minus everything a line
+ * has no use for: no normals, lighting, UVs or fog, just position, depth, color
+ * and clip-codes. The buffer layout stays identical.
+ */
+command<4> T3DCmd_VertLoad(u32 bufferSize, u32 rdramVerts, u32 addressInOut)
+{
+  u32<$s4> prt3d = addressInOut >> 16;
+
+  u32<$t0> copySize = bufferSize & 0xFFFF;
+  u32 ptr3dEnd = prt3d + copySize;
+
+  u32<$s0> dmaAddrRDRAM;
+  resolveSegmentAddr(dmaAddrRDRAM, rdramVerts);
+  dma_in_async(prt3d, dmaAddrRDRAM, copySize);
+  undef copySize;
+  undef dmaAddrRDRAM;
+  undef bufferSize;
+  undef rdramVerts;
+
+  vec32 mat0, mat1, mat2, mat3;
+  loadCurrentMVPMat(mat0, mat1, mat2, mat3);
+
+  vec16 guardBandScale = load(CLIPPING_PLANES).xy;
+  guardBandScale = guardBandScale.y;
+
+  vec32 screenSize:sint = load(SCREEN_SCALE_OFFSET).xyzwxyzw;
+  screenSize:sfract = 0;
+  screenSize >>= 8;
+
+  vec16 screenOffset = load(SCREEN_SCALE_OFFSET, 0x08).xyzwxyzw;
+  vec16 normScaleW = load(NORM_SCALE_W).xyzwxyzw;
+
+  vec16 colorKeep = load(LINE_COLOR_KEEP).xyzwxyzw;
+  vec16 colorSet = load(LINE_COLOR_SET).xyzwxyzw;
+
+  u32 ptrBuffA = addressInOut & 0xFFFF;
+  u32 ptrBuffB = ptrBuffA - TRI_SIZE;
+  ptrBuffA -= TRI_SIZE_2; // compensate for the increment at the start of the loop
+
+  undef addressInOut;
+
+  // Last thing a display-list does before drawing, so a material change has landed by now
+  {
+    u16 combDirty = load(LINE_COMB_FORCE);
+    store(combDirty, LINE_COMB_DIRTY);
+  }
+
+  dma_await();
+
+  loop {
+    ptrBuffA += TRI_SIZE_2;
+    ptrBuffB += TRI_SIZE_2;
+
+    vec16 pos = load(prt3d, 0x00);
+    vec32 posClip;
+    mulMat4Vec3(mat0, mat1, mat2, mat3, pos, posClip);
+
+    vec16 color = load_vec_u8(prt3d, 0x10);
+    color &= colorKeep;
+    color |= colorSet;
+
+    vec32 clipPlaneW = guardBandScale * posClip.wwwwWWWW;
+
+    u32 clipCodeA, clipCodeB;
+    {
+      u32 clipCodes = clip(posClip, clipPlaneW);
+      clipCodeB = clipCodes >> 4;
+      clipCodeA = packClipCode(clipCodes);
+      clipCodeB = packClipCode(clipCodeB);
+    }
+    undef clipPlaneW;
+
+    posClip *= normScaleW:ufract;
+
+    @Barrier("color") store_vec_u8(color.x, ptrBuffA, VTX_ATTR_RGBA);
+    @Barrier("color") store_vec_u8(color.X, ptrBuffB, VTX_ATTR_RGBA);
+
+    store(posClip.xyzw, ptrBuffA, VTX_ATTR_CLIPPOSi);
+    store(posClip.XYZW, ptrBuffB, VTX_ATTR_CLIPPOSi);
+
+    screenSize.w = invert_half(posClip).w;
+    screenSize.W = invert_half(posClip).W;
+
+    posClip *= screenSize.wwwwWWWW; // (contains inverse W)
+    posClip *= screenSize;
+    posClip:sint = screenOffset:sint +* 1;
+
+    prt3d += 0x20;
+
+    @Barrier("pos-cc") store(posClip:sint.xyzw, ptrBuffA, VTX_ATTR_XY);
+    @Barrier("pos-cc") store(posClip:sint.XYZW, ptrBuffB, VTX_ATTR_XY);
+    @Barrier("pos-cc") store(clipCodeA:u8, ptrBuffA, VTX_ATTR_CLIPFLAGS);
+    @Barrier("pos-cc") store(clipCodeB:u8, ptrBuffB, VTX_ATTR_CLIPFLAGS);
+
+  } while(prt3d != ptr3dEnd)
+}
+
+/**
+ * Emits one RDP triangle command describing a line.
+ *
+ * The RDP fills row by row, so a "triangle" to it is really a left edge, a right
+ * edge, and how far each one shifts per row. Shift them by different amounts and the
+ * rows narrow to a point; shift them by the same amount and every row stays equally
+ * wide - a slanted ribbon, which becomes the line:
+ *
+ *      triangle            ribbon (this function)
+ *      |======|            |==|
+ *       |====|              |==|
+ *        |==|                |==|
+ *         ||                  |==|
+ *
+ * @param ptrA first vertex (DMEM)
+ * @param ptrB second vertex (DMEM)
+ * @param buff RDP command buffer write pointer, advanced by LINE_CMD_SIZE
+ * @param minWidth minimum line width in 1/4 pixels, >= 4
+ */
+function emitLine(u32<$a0> ptrA, u32<$a1> ptrB, u16<$s3> buff, u16<$t6> minWidth)
+{
+  // caller state declared unused so the allocator won't hand them out
+  u32<$s1> _rsvV0; u32<$s6> _rsvV1; u32<$s7> _rsvV2;
+  u8<$v0> _rsvCull; u16<$v1> _rsvRet;
+  u16<$s5> _rsvLoopPtr; u16<$t8> _rsvLoopEnd;
+  u16<$s2> _rsvLoopIncr; u16<$t9> _rsvLoopFlag;
+
+  // The RDP only walks top to bottom, and a line pointing up covers the same pixels
+  // as the same line pointing down - so sorting drops half of all directions here.
+  s16 yA = load(ptrA, 0x02);
+  s16 yB = load(ptrB, 0x02);
+  if(yA > yB) {
+    swap(ptrA, ptrB);
+  }
+
+  vec16 posA = load(ptrA, 0x00).xyzw;  // x, y, z, (flags)
+  vec16 posB = load(ptrB, 0x00).xyzw;
+  vec16 colA = load_vec_u8(ptrA, 0x08);   // R, G, B, A in lanes 0-3
+  vec16 colB = load_vec_u8(ptrB, 0x08);
+  colA >>= 7; // 0..255 as an integer
+  colB >>= 7;
+
+  s16 y0 = load(ptrA, 0x02);
+  s16 y1 = load(ptrB, 0x02);
+
+  // ---- scanline range ---------------------------------------------------------
+  // Snapped to whole rows, the first row then starts exactly at x0, so the RDP's
+  // sub-scanline correction isn't needed. Costs up to one scanline of Y accuracy,
+  // which at wireframe widths is not really visible.
+  s16 rowStart = y0 >> 2;
+  s16 rowEnd = y1 + 3;
+  rowEnd >>= 2;
+  s16 rowCount = rowEnd - rowStart;
+
+  // The ribbon's walls are vertical, so its width is measured SIDEWAYS. That is the
+  // entire thickness of a steep line, but does nothing for a flat one, which spans no
+  // rows at all. So the row count is floored at the line width instead: a flat line
+  // then has to cross its whole length within those rows, which makes 'slope' huge and
+  // turns every row into a long horizontal streak.
+  //
+  //   steep: the sideways width      flat: the row floor gives the thickness, and the
+  //   is the thickness               huge per-row shift covers the length
+  //
+  //       |==|                       |=================|
+  //       |==|                                 |=================|
+  //       |==|                       '------- one 2px thick bar -------'
+  //
+  // Nothing tests the angle - both rules always apply, and whichever one matters at
+  // that angle simply dominates. Around 45 degrees neither pulls its full weight, so
+  // diagonals come out a bit thinner which doesn't matter much visually.
+  s16 minRows = minWidth + 2;
+  minRows >>= 2;
+  if(rowCount < minRows) {
+    rowCount = minRows;
+  }
+
+  s16 yTop = rowStart << 2;
+  s16 yBot = rowStart + rowCount;
+  yBot <<= 2;
+
+  // ---- 1 / rowCount -----------------------------------------------------------
+  // vrcp normalizes, so this keeps ~16 significant bits at any line length.
+  vec16 rowVec;
+  rowVec.x = rowCount;
+  vec32 recip;
+  recip.x = invert_half(rowVec).x;
+
+  // ---- per-row derivatives ------------------------------------------------------
+  // Slope is 'dx / rowCount', not 'dx / dy'. Since rowCount was rounded up, dividing
+  // by dy would give every row a full row's worth of travel and run the band past the
+  // far endpoint by up to one row - most of the line, if it is near-horizontal.
+  //
+  // The deltas sit in the fractional half, so 'delta * recip' lands as
+  // 'delta / (2 * rowCount)'; the shifts below take out the remaining factor.
+  vec16 dPosRaw = posB - posA;
+  vec16 dColRaw = colB - colA;
+  undef colB;
+  undef posB;
+
+  vec32 dPos;
+  dPos:sfract = dPosRaw:sfract;
+  dPos:sint = dPosRaw >> 15; // sign extension
+  undef dPosRaw;
+
+  vec32 dCol;
+  dCol:sfract = dColRaw:sfract;
+  dCol:sint = dColRaw >> 15;
+  undef dColRaw;
+
+  vec32 sPos = dPos * recip.x;
+  undef dPos;
+  vec32 sCol = dCol * recip.x;
+  undef dCol;
+  undef recip;
+
+  vec32 slope = sPos >> 1;       // lane x: dx per row in whole pixels. Two shifts below
+                                 // z/color, because x is stored in 1/4 pixels
+  vec32 dZdy  = sPos << 1;       // lane z: dz per row
+  undef sPos;
+  vec32 dCdy  = sCol << 1;       // lanes x-w: dcolor per row
+  undef sCol;
+
+  // ---- horizontal span ----------------------------------------------------------
+  // A row has to cover x(row) .. x(row)+slope, but only a QUARTER of the slope goes
+  // in here: the RDP samples every edge at 4 sub-scanlines per row, stepping by
+  // slope/4 each time, and unions the results - so it already sweeps 3/4 of the
+  // row's travel on its own. Adding the full slope overshot each row by 0.75*slope.
+  // Sub-pixel on a steep line, but 'slope' is 'dx / rowCount' with rowCount floored
+  // at the line width, so a horizontal edge grew a spike a third of its own length,
+  // drawn solid (the RDP writes any pixel with non-zero coverage).
+  //
+  // Leaning left and leaning right are mirror images, so the only question is which
+  // side of the row the extra travel is padded onto - the one the line is heading for:
+  //
+  //   leaning right        leaning left
+  //     |==|                     |==|
+  //      |==|                   |==|
+  //       |==|                 |==|
+  //
+  vec32 spanLo, spanHi;
+  {
+    vec32 step = slope >> 2;                // one sub-scanline step
+    // Sign by shift, not by compare: 'vlt' breaks exact ties (slope's integer half is
+    // 0 for anything steeper than 45 degrees) using VCO, which is whatever the last
+    // vector op left there. That made the span's direction follow the color delta.
+    vec16 signMask = slope:sint >> 15;      // 0 if positive, -1 if negative
+    spanLo:sint   = step:sint   & signMask;
+    spanLo:sfract = step:sfract & signMask;
+    spanHi = step - spanLo;                 // the two always add back up to step
+  }
+  vec32 halfW;
+  {
+    u32 halfWidth = minWidth;
+    halfWidth <<= 13;            // 1/4 pixels -> s16.16 pixels, halved
+    halfW.x = halfWidth;
+  }
+
+  // ---- edge coefficients ---------------------------------------------------------
+  // The band's two walls, same slope. xH is the major edge, put on the left by the
+  // "left major" flag in RDP_CMD_LINE; xM (and XL) is the right one. The gap between
+  // them is the line width plus one sub-scanline step.
+  vec32 xH, xM;
+  {
+    vec32 xPx;
+    xPx:sint = posA >> 2;        // 1/4 pixels -> s16.16 pixels
+    xPx:sfract = posA << 14;
+
+    xH = xPx + spanLo.x;
+    xH -= halfW.x;
+    xM = xPx + spanHi.x;
+    xM += halfW.x;
+  }
+  undef halfW;
+  undef spanLo;
+  undef spanHi;
+
+  // ---- write the command ---------------------------------------------------------
+  // YM goes on YH, not on YL. The RDP anchors XM at YH but XL at YM, so YM == YL
+  // would evaluate XL from an origin a full 'rowCount * slope' off - the entire
+  // length of the line. With YM == YH both minor edges share one anchor and it no
+  // longer matters which the RDP walks. (A flat-top triangle, common in libdragon.)
+  u32 yTopMasked = yTop & 0x3FFF;
+  u32 cmdYL = yBot & 0x3FFF;
+  cmdYL |= RDP_CMD_LINE;
+  u32 cmdYM = yTopMasked << 16;
+  cmdYM |= yTopMasked;
+
+  store(cmdYL, buff, 0x00);
+  store(cmdYM, buff, 0x04);
+
+  // XL runs YM..YL anchored at YM, which is YH here, so it is just XM again
+  store(xM:sint.x,      buff, 0x08);
+  store(xM:ufract.x,    buff, 0x0A);
+  store(slope:sint.x,   buff, 0x0C);
+  store(slope:ufract.x, buff, 0x0E);
+
+  store(xH:sint.x,      buff, 0x10);
+  store(xH:ufract.x,    buff, 0x12);
+  store(slope:sint.x,   buff, 0x14);
+  store(slope:ufract.x, buff, 0x16);
+
+  store(xM:sint.x,      buff, 0x18);
+  store(xM:ufract.x,    buff, 0x1A);
+  store(slope:sint.x,   buff, 0x1C);
+  store(slope:ufract.x, buff, 0x1E);
+
+  // ---- shade coefficients ---------------------------------------------------------
+  // Color only varies along the line, so DrDx is 0 and DrDe == DrDy. The base sits
+  // on the first row exactly and needs no correction.
+  store(colA.xyzw,         buff, 0x20); // RGBA integer
+  store(VZERO:sint.xyzw,   buff, 0x28); // DrDx.. integer
+  store(VZERO:sint.xyzw,   buff, 0x30); // RGBA fraction
+  store(VZERO:sint.xyzw,   buff, 0x38); // DrDx.. fraction
+  store(dCdy:sint.xyzw,    buff, 0x40); // DrDe.. integer
+  store(dCdy:sint.xyzw,    buff, 0x48); // DrDy.. integer
+  store(dCdy:ufract.xyzw,  buff, 0x50); // DrDe.. fraction
+  store(dCdy:ufract.xyzw,  buff, 0x58); // DrDy.. fraction
+
+  // ---- depth coefficients ---------------------------------------------------------
+  store(posA.z,         buff, 0x60);
+  store(ZERO:u16,       buff, 0x62);
+  store(ZERO,           buff, 0x64);    // DzDx
+  store(dZdy:sint.z,    buff, 0x68);
+  store(dZdy:ufract.z,  buff, 0x6A);
+  store(dZdy:sint.z,    buff, 0x6C);
+  store(dZdy:ufract.z,  buff, 0x6E);
+
+  buff += LINE_CMD_SIZE;
+}
+
+/**
+ * Emits two lines at once. Edge 0 goes in lanes x-w, edge 1 in lanes X-W, so every
+ * 8-lane op does the work of two 'emitLine' calls. Same math, see there.
+ *
+ * @param ptr0 first vertex, edge 0 runs ptr0 -> ptr1
+ * @param ptr1 second vertex, shared by both edges
+ * @param ptr2 third vertex, edge 1 runs ptr1 -> ptr2
+ * @param buff RDP command buffer write pointer, advanced by LINE_CMD_SIZE_2
+ * @param minWidth line width in 1/4 pixels
+ */
+function emitLine2(u32<$a0> ptr0, u32<$a1> ptr1, u32<$a2> ptr2, u16<$s3> buff, u16<$t6> minWidth)
+{
+  // caller state, declared unused so the allocator won't hand them out
+  u32<$s1> _rsvV0; u32<$s6> _rsvV1; u32<$s7> _rsvV2;
+  u8<$v0> _rsvCull; u16<$v1> _rsvRet;
+  u16<$s5> _rsvLoopPtr; u16<$t8> _rsvLoopEnd;
+  u16<$s2> _rsvLoopIncr; u16<$t9> _rsvLoopFlag;
+
+  // ---- order both edges by Y ---------------------------------------------------
+  // 'ptr1' sits on both edges, so edge 0's copy of it is taken before swapping.
+  // Y travels along with the pointers, saving a re-load further down.
+  u32<$a3> pB0 = ptr1;
+  s16 yA0 = load(ptr0, 0x02);
+  s16 yB0 = load(pB0, 0x02);
+  if(yA0 > yB0) {
+    swap(ptr0, pB0);
+    swap(yA0, yB0);
+  }
+
+  s16 yA1 = load(ptr1, 0x02);
+  s16 yB1 = load(ptr2, 0x02);
+  if(yA1 > yB1) {
+    swap(ptr1, ptr2);
+    swap(yA1, yB1);
+  }
+
+  // ---- gather both edges into the two register halves --------------------------
+  vec16 posA;
+  posA.xyzw = load(ptr0, 0x00).xyzw;   // x, y, z, (flags)
+  posA.XYZW = load(ptr1, 0x00).xyzw;
+  vec16 posB;
+  posB.xyzw = load(pB0,  0x00).xyzw;
+  posB.XYZW = load(ptr2, 0x00).xyzw;
+
+  // Four registers rather than two halves of two: 'luv' always writes all 8 lanes and
+  // rotates the byte-to-lane mapping, so loading into '.XYZW' would wipe '.xyzw'.
+  vec16 colA0 = load_vec_u8(ptr0, 0x08);   // R, G, B, A
+  vec16 colB0 = load_vec_u8(pB0,  0x08);
+  vec16 colA1 = load_vec_u8(ptr1, 0x08);
+  vec16 colB1 = load_vec_u8(ptr2, 0x08);
+  colA0 >>= 7; // 0..255 as an integer
+  colB0 >>= 7;
+  colA1 >>= 7;
+  colB1 >>= 7;
+
+  undef ptr0;
+  undef ptr1;
+  undef ptr2;
+  undef pB0;
+
+  u16 buff2 = buff;
+  buff2 += LINE_CMD_SIZE;
+
+  // ---- scalar row arithmetic, one edge at a time -------------------------------
+  // Holding both edges' row values at once runs the allocator out of GPRs, so each
+  // edge is finished and its Y words written before the other one starts.
+  s16 minRows = minWidth + 2;
+  minRows >>= 2;
+
+  vec16 rowVec;
+  {
+    s16 rowStart = yA0 >> 2;
+    s16 rowCount = yB0 + 3;
+    rowCount >>= 2;
+    rowCount -= rowStart;
+    if(rowCount < minRows) {
+      rowCount = minRows;
+    }
+    rowVec.x = rowCount;
+
+    s16 yTop = rowStart << 2;
+    s16 yBot = rowStart + rowCount;
+    yBot <<= 2;
+    u32 yTopMasked = yTop & 0x3FFF;
+    u32 cmdYL = yBot & 0x3FFF;
+    cmdYL |= RDP_CMD_LINE;
+    u32 cmdYM = yTopMasked << 16;
+    cmdYM |= yTopMasked;
+    store(cmdYL, buff, 0x00);
+    store(cmdYM, buff, 0x04);
+  }
+  undef yA0;
+  undef yB0;
+
+  {
+    s16 rowStart = yA1 >> 2;
+    s16 rowCount = yB1 + 3;
+    rowCount >>= 2;
+    rowCount -= rowStart;
+    if(rowCount < minRows) {
+      rowCount = minRows;
+    }
+    rowVec.X = rowCount;
+
+    s16 yTop = rowStart << 2;
+    s16 yBot = rowStart + rowCount;
+    yBot <<= 2;
+    u32 yTopMasked = yTop & 0x3FFF;
+    u32 cmdYL = yBot & 0x3FFF;
+    cmdYL |= RDP_CMD_LINE;
+    u32 cmdYM = yTopMasked << 16;
+    cmdYM |= yTopMasked;
+    store(cmdYL, buff2, 0x00);
+    store(cmdYM, buff2, 0x04);
+  }
+  undef yA1;
+  undef yB1;
+  undef minRows;
+
+  // ---- 1 / rowCount, one lane per edge -----------------------------------------
+  // 'vrcp' only does one lane, so this stays two instructions; everything after is
+  // shared. 'xxxxXXXX' is the h0 swizzle: lane 0 to the low half, lane 4 to the high.
+  vec32 recip;
+  recip.x = invert_half(rowVec).x;
+  recip.X = invert_half(rowVec).X;
+  undef rowVec;
+
+  // ---- per-row derivatives, both edges at once ---------------------------------
+  vec16 dPosRaw = posB - posA;
+  undef posB;
+
+  vec32 dPos;
+  dPos:sfract = dPosRaw:sfract;
+  dPos:sint = dPosRaw >> 15; // sign extension
+  undef dPosRaw;
+
+  vec32 sPos = dPos * recip.xxxxXXXX;
+  undef dPos;
+
+  vec32 slope = sPos >> 1;       // lanes x/X: dx pixels per row
+  vec32 dZdy  = sPos << 1;       // lanes z/Z: dz per row
+  undef sPos;
+
+  // ---- horizontal span (see 'emitLine' for why this is slope/4) ----------------
+  vec32 spanLo, spanHi;
+  {
+    vec32 step = slope >> 2;
+    vec16 signMask = slope:sint >> 15;
+    spanLo:sint   = step:sint   & signMask;
+    spanLo:sfract = step:sfract & signMask;
+    spanHi = step - spanLo;
+  }
+  vec32 halfW;
+  {
+    u32 halfWidth = minWidth;
+    halfWidth <<= 13;            // 1/4 pixels -> s16.16 pixels, halved
+    halfW.x = halfWidth;         // same for both edges, broadcast from lane 0
+  }
+
+  // ---- edge coefficients --------------------------------------------------------
+  vec32 xH, xM;
+  {
+    vec32 xPx;
+    xPx:sint = posA >> 2;
+    xPx:sfract = posA << 14;
+
+    xH = xPx + spanLo.xxxxXXXX;
+    xH -= halfW.xxxxxxxx;
+    xM = xPx + spanHi.xxxxXXXX;
+    xM += halfW.xxxxxxxx;
+  }
+  undef halfW;
+  undef spanLo;
+  undef spanHi;
+
+  // ---- write the rest of both commands -------------------------------------------
+  store(xM:sint.x,      buff, 0x08);
+  store(xM:ufract.x,    buff, 0x0A);
+  store(slope:sint.x,   buff, 0x0C);
+  store(slope:ufract.x, buff, 0x0E);
+  store(xH:sint.x,      buff, 0x10);
+  store(xH:ufract.x,    buff, 0x12);
+  store(slope:sint.x,   buff, 0x14);
+  store(slope:ufract.x, buff, 0x16);
+  store(xM:sint.x,      buff, 0x18);
+  store(xM:ufract.x,    buff, 0x1A);
+  store(slope:sint.x,   buff, 0x1C);
+  store(slope:ufract.x, buff, 0x1E);
+
+  store(xM:sint.X,      buff2, 0x08);
+  store(xM:ufract.X,    buff2, 0x0A);
+  store(slope:sint.X,   buff2, 0x0C);
+  store(slope:ufract.X, buff2, 0x0E);
+  store(xH:sint.X,      buff2, 0x10);
+  store(xH:ufract.X,    buff2, 0x12);
+  store(slope:sint.X,   buff2, 0x14);
+  store(slope:ufract.X, buff2, 0x16);
+  store(xM:sint.X,      buff2, 0x18);
+  store(xM:ufract.X,    buff2, 0x1A);
+  store(slope:sint.X,   buff2, 0x1C);
+  store(slope:ufract.X, buff2, 0x1E);
+  undef xH;
+  undef xM;
+  undef slope;
+
+  // colors, one edge at a time
+  {
+    vec16 dColRaw = colB0 - colA0;
+    undef colB0;
+    vec32 dCol;
+    dCol:sfract = dColRaw:sfract;
+    dCol:sint = dColRaw >> 15;
+    undef dColRaw;
+    vec32 dCdy = dCol * recip.xxxxxxxx;
+    undef dCol;
+    dCdy <<= 1;
+
+    store(colA0.xyzw,        buff, 0x20); // RGBA integer
+    store(VZERO:sint.xyzw,   buff, 0x28); // DrDx.. integer
+    store(VZERO:sint.xyzw,   buff, 0x30); // RGBA fraction
+    store(VZERO:sint.xyzw,   buff, 0x38); // DrDx.. fraction
+    store(dCdy:sint.xyzw,    buff, 0x40); // DrDe.. integer
+    store(dCdy:sint.xyzw,    buff, 0x48); // DrDy.. integer
+    store(dCdy:ufract.xyzw,  buff, 0x50); // DrDe.. fraction
+    store(dCdy:ufract.xyzw,  buff, 0x58); // DrDy.. fraction
+  }
+  undef colA0;
+
+  {
+    vec16 dColRaw = colB1 - colA1;
+    undef colB1;
+    vec32 dCol;
+    dCol:sfract = dColRaw:sfract;
+    dCol:sint = dColRaw >> 15;
+    undef dColRaw;
+    vec32 dCdy = dCol * recip.XXXXXXXX;
+    undef dCol;
+    dCdy <<= 1;
+
+    store(colA1.xyzw,        buff2, 0x20);
+    store(VZERO:sint.xyzw,   buff2, 0x28);
+    store(VZERO:sint.xyzw,   buff2, 0x30);
+    store(VZERO:sint.xyzw,   buff2, 0x38);
+    store(dCdy:sint.xyzw,    buff2, 0x40);
+    store(dCdy:sint.xyzw,    buff2, 0x48);
+    store(dCdy:ufract.xyzw,  buff2, 0x50);
+    store(dCdy:ufract.xyzw,  buff2, 0x58);
+  }
+  undef colA1;
+  undef recip;
+
+  store(posA.z,         buff, 0x60);
+  store(ZERO:u16,       buff, 0x62);
+  store(ZERO,           buff, 0x64);    // DzDx
+  store(dZdy:sint.z,    buff, 0x68);
+  store(dZdy:ufract.z,  buff, 0x6A);
+  store(dZdy:sint.z,    buff, 0x6C);
+  store(dZdy:ufract.z,  buff, 0x6E);
+
+  store(posA.Z,         buff2, 0x60);
+  store(ZERO:u16,       buff2, 0x62);
+  store(ZERO,           buff2, 0x64);
+  store(dZdy:sint.Z,    buff2, 0x68);
+  store(dZdy:ufract.Z,  buff2, 0x6A);
+  store(dZdy:sint.Z,    buff2, 0x6C);
+  store(dZdy:ufract.Z,  buff2, 0x6E);
+
+  buff += LINE_CMD_SIZE_2;
+}
+
+/**
+ * Turns one triangle into three lines and submits them. Vertices come from the
+ * pinned globals; ends in a tail-call to RDPQ_Send, which returns to 'gRetTri'.
+ */
+function drawTriLines()
+{
+  u32<$s1> gV0; u32<$s6> gV1; u32<$s7> gV2;
+  u16<$v1> gRetTri;
+
+  // The previous batch's DMA out of RDP_BUFF may still be running. tiny3d avoids the
+  // wait by double-buffering its 176-byte triangle output, but two 336-byte line
+  // buffers do not fit. Rarely stalls in practice - the clip checks and the first
+  // line's setup usually cover the transfer.
+  dma_await();
+  // reserved for the caller's and emitLine's registers
+  u8<$v0> _rsvCull;
+  u16<$s5> _rsvLoopPtr; u16<$t8> _rsvLoopEnd;
+  u16<$s2> _rsvLoopIncr; u16<$t9> _rsvLoopFlag;
+  // first 16 bytes are reserved for the optional SYNC_PIPE + SET_COMBINE pair
+  u16<$s3> buff = RDP_BUFF;
+  buff += LINE_HDR_SIZE;
+  u16<$t6> minWidth = load(LINE_WIDTH);
+
+  // Clip- and reject-codes of all three vertices OR'd together, tiny3d's layout:
+  //   high byte = clip-code   (bit set: outside that guard-band / near plane)
+  //   low byte  = reject-code (bit set: inside that plane)
+  {
+    u16 ccA = load(gV0, 0x06);
+    u16 ccB = load(gV1, 0x06);
+    u16 ccC = load(gV2, 0x06);
+    ccA |= ccB;
+    ccA |= ccC;
+
+    u32 rejCode = ccA & 0xFF;
+    // all three vertices outside the same plane -> nothing to draw
+    if(rejCode != 0xFF)goto TRI_LINES_SKIP;
+
+    // Lines are never clipped: inside the guard band goes to the RDP as-is (it
+    // scissors), past it - near plane included - is dropped.
+    ccA &= 0x1F00;
+    if(ccA)goto TRI_LINES_SKIP;
+  }
+
+  // No backface culling: a wireframe shows every edge, front and back.
+
+  // Edges (gV0,gV1) and (gV1,gV2) share one pass of vector math, the third goes alone
+  {
+    u32<$a0> edgeV0 = gV0;
+    u32<$a1> edgeV1 = gV1;
+    u32<$a2> edgeV2 = gV2;
+    RA = TRI_LINES_2;
+    goto emitLine2;
+  }
+  TRI_LINES_2:
+  {
+    // Consecutive strip triangles share an edge: {i0,i1,i2} then {i1,i2,i3} share
+    // (i1,i2), which the index loads map to (gV0 -> gV1) in the first triangle and
+    // to (gV2 -> gV0) in the second - the same pixels twice, so drop the second.
+    // Only valid if the previous triangle actually drew, which is why this function
+    // owns the flag (set below, cleared at TRI_LINES_SKIP) instead of the strip loop.
+    u16 skipEdge = load(LINE_SKIP_EDGE);
+    if(skipEdge != 0)goto TRI_LINES_3;
+
+    u32<$a0> lineA = gV2;
+    u32<$a1> lineB = gV0;
+    RA = TRI_LINES_3;
+    goto emitLine;
+  }
+  TRI_LINES_3:
+  {
+    u16 didDraw = 1;
+    store(didDraw, LINE_SKIP_EDGE);
+  }
+
+  // Lines are shaded, never textured, so the color comes from the shade channel. A
+  // recorded display-list installs its own combiner per material though, which would
+  // have the lines sample a texture or prim color instead. Take it over, once per
+  // batch rather than per triangle.
+  u16<$s4> sendStart = RDP_BUFF;
+  {
+    u16 combDirty = load(LINE_COMB_DIRTY);
+    if(combDirty == 0) {
+      sendStart += LINE_HDR_SIZE;      // header not needed, skip past it
+    } else {
+      u32 syncPipe = RDP_SYNC_PIPE;
+      u32 combHi = RDP_SET_COMB_HI;
+      u32 combLo = RDP_SET_COMB_LO;
+      store(syncPipe, sendStart, 0x00);
+      store(ZERO,     sendStart, 0x04);
+      store(combHi,   sendStart, 0x08);
+      store(combLo,   sendStart, 0x0C);
+      store(ZERO:u16, LINE_COMB_DIRTY);
+    }
+  }
+
+  // tail-call, RDPQ_Send returns straight to our caller
+  RA = gRetTri;
+  goto RDPQ_Send;
+
+  TRI_LINES_SKIP:
+  // nothing was drawn, so the next triangle cannot inherit an edge from this one
+  store(ZERO:u16, LINE_SKIP_EDGE);
+  RA = gRetTri;
+  goto RA;
+}
+
+/**
+ * Draws a single triangle as a wireframe.
+ * @param vert0 16-LSB contain the DMEM address of the first vertex
+ * @param vert1 LSB/MSB contain the DMEM address of the second + third vertex
+ */
+@NoReturn
+command<0> T3DCmd_TriDraw(u32 vert0, u32 vert1)
+{
+  u32<$s1> gV0; u32<$s6> gV1; u32<$s7> gV2;
+  u16<$v1> gRetTri;
+  gV2 = vert1 >> 16;
+  gV1 = vert1 & 0xFFFF;
+  gV0 = vert0 & 0xFFFF;
+  gRetTri = RSPQ_Loop;
+  store(ZERO:u16, LINE_SKIP_EDGE);   // a lone triangle shares nothing
+  goto drawTriLines;
+}
+
+@NoReturn
+command<11> T3DCmd_TriDraw_Strip(u32 rdramAddr, u32 countDmem)
+{
+  u32<$s1> gV0; u32<$s6> gV1; u32<$s7> gV2;
+  u16<$v1> gRetTri;
+  u16<$s5> gLoopPtr; u16<$t8> gLoopEnd;
+  u16<$s2> gLoopIncr; u16<$t9> gLoopFlag;
+  u32<$s0> dmaAddrRDRAM = rdramAddr;
+  u16<$t0> copySize = countDmem & 0xFFFF;
+  s16<$s4> prtDmem = countDmem >> 16;
+
+  loop { // wait for a previous DMA to be done
+    RA = get_dma_busy();
+  } while(RA != 0)
+
+  gLoopEnd = prtDmem + copySize;
+  dma_in_async(prtDmem, dmaAddrRDRAM, copySize);
+
+  undef rdramAddr;
+  undef countDmem;
+  undef copySize;
+  undef dmaAddrRDRAM;
+
+  gLoopEnd -= 3;
+  gLoopPtr = prtDmem;
+  gLoopPtr -= 2; // compensate for the first increment in the loop
+  undef prtDmem;
+
+  loop { // wait for the index DMA
+    RA = get_dma_busy();
+  } while(RA != 0)
+
+  STRIP_LOOP_NEW:
+    // start of a (sub-)strip: the first triangle has no predecessor
+    store(ZERO:u16, LINE_SKIP_EDGE);
+    gLoopPtr += 2;
+  STRIP_LOOP_NEXT:
+    if(gLoopPtr == gLoopEnd)goto STRIP_LOOP_END;
+
+    gV0:u16  = load(gLoopPtr, 2);
+    gV2:u16  = load(gLoopPtr, 0);
+    s16 idx1 = load(gLoopPtr, 4); // the sign bit marks the end of a strip
+    gV1 = idx1 & 0xFFFF;
+
+    gLoopPtr += 2;
+    if(idx1 < 0)goto STRIP_LOOP_NEW;
+
+    gRetTri = STRIP_LOOP_NEXT;
+    goto drawTriLines;
+
+  STRIP_LOOP_END:
+  goto RSPQ_Loop;
+}
+
+@NoReturn
+command<12> T3DCmd_TriDraw_Seq(u32 sizeAndIndex, u16 endIndex)
+{
+  u32<$s1> gV0; u32<$s6> gV1; u32<$s7> gV2;
+  u16<$v1> gRetTri;
+  u16<$s5> gLoopPtr; u16<$t8> gLoopEnd;
+  u16<$s2> gLoopIncr; u16<$t9> gLoopFlag;
+  gLoopEnd = endIndex & 0xFFFF;
+  gLoopPtr = sizeAndIndex & 0xFFFF;
+
+  gLoopFlag = endIndex >> 16; // non-zero for quads: the mesh is drawn a second time
+  gLoopIncr = gLoopFlag + TRI_SIZE_3;
+
+  undef sizeAndIndex;
+  undef endIndex;
+
+  SEQ_LOOP_NEXT:
+    if(gLoopPtr == gLoopEnd)goto SEQ_LOOP_END;
+    gV0 = gLoopPtr + TRI_SIZE_2;
+    gV1 = gLoopPtr + TRI_SIZE;
+    gV2 = gLoopPtr;
+    gLoopPtr += gLoopIncr;
+
+    store(ZERO:u16, LINE_SKIP_EDGE);   // sequences carry no shared-edge order
+    gRetTri = SEQ_LOOP_NEXT;
+    goto drawTriLines;
+
+  SEQ_LOOP_END:
+    if(gLoopFlag) {
+      gLoopFlag = 0;
+      gLoopPtr:u16 = load_arg(2);
+      gLoopPtr += TRI_SIZE;
+      gLoopEnd += TRI_SIZE;
+      goto SEQ_LOOP_NEXT;
+    }
+  goto RSPQ_Loop;
+}
+
+/** Lines go out as each triangle finishes, so this only lets the last one drain. */
+command<10> T3DCmd_TriSync()
+{
+  dma_await();
+}
+
+/** Sets the screen size in pixels (identical to tiny3d). */
+command<1> T3DCmd_SetScreenSize(s8 guardBandFactor, u32 screenOffsetXY, u32 screenScaleXY, u32 depthAndWScale)
+{
+  store(depthAndWScale:u32, SCREEN_SCALE_OFFSET, 0x04);
+  store(screenScaleXY, SCREEN_SCALE_OFFSET, 0x00);
+  store(screenOffsetXY, SCREEN_SCALE_OFFSET, 0x08);
+
+  store(depthAndWScale:s16, NORM_SCALE_W, 6);
+
+  u16 uvgenScaleFactor = guardBandFactor >> 8;
+  store(uvgenScaleFactor, SCREEN_UVGEN_SCALE);
+
+  guardBandFactor &= 0xF;
+  s8 guardBandFactorNeg = ZERO - guardBandFactor;
+
+  store(guardBandFactor,    CLIPPING_PLANES, 3);
+  store(guardBandFactor,    CLIPPING_PLANES, 7);
+  store(guardBandFactorNeg, CLIPPING_PLANES, 15);
+  store(guardBandFactorNeg, CLIPPING_PLANES, 19);
+}
+
+#define MATRIX_TEMP_MUL RDP_BUFF
+#include "inc/matrixStack.rspl"
+
+/** Stores a 16- or 32-bit word at an arbitrary DMEM address. */
+command<3> T3DCmd_SetWord(u16 addrDMEM, u32 value) {
+  u32 is16bit = addrDMEM & 0x8000;
+  store(value:u16, addrDMEM);
+
+  if(is16bit)goto RSPQ_Loop;
+
+  store(value:u32, addrDMEM);
+}
+
+/** Does nothing for wireframes, the stores just keep DMEM identical to tiny3d's. */
+command<5> T3DCmd_LightSet(u32 addr, u32 rgba8, u32 dirXYZ0, u32 dirXYZ1)
+{
+  store(rgba8, addr, 0);
+
+  if(dirXYZ0) {
+    store(dirXYZ0, addr, 8);
+    store(dirXYZ1, addr, 12);
+  }
+
+  store(rgba8, addr, 4);
+}
+
+command<6> T3DCmd_RenderMode(u8 culling, u32 triCommand) {
+  store(culling, FACE_CULLING);
+  store(triCommand, TRI_COMMAND);
+  // a render-mode change means the display-list is switching material
+  u16 combDirty = load(LINE_COMB_FORCE);
+  store(combDirty, LINE_COMB_DIRTY);
+}
+
+command<7> T3DCmd_MatProjectionSet(u32 addressMat) {
+  u32<$s0> addrRDRAM = addressMat;
+  dma_in(MATRIX_PROJ, addrRDRAM, 0x40);
+}
+
+/** Patches the tiny3d ucode image in RDRAM. Unused here. */
+command<8> T3DCmd_Patch(u32 rdramAddr_, u32 opcode0, u32 opcode1) {
+    u16<$t0> size = 8 - 1;
+    u32<$s0> rdramAddr = rdramAddr_;
+    s16<$s4> dmemAddr = RSPQ_SCRATCH_MEM;
+
+    store(opcode0, dmemAddr, 0);
+    store(opcode1, dmemAddr, 4);
+
+    DMAOut(size, rdramAddr, dmemAddr);
+}
+
+command<9> T3DCmd_SetFogState(u8 enabled)
+{
+  store(enabled, FOG_STORE_OFFSET);
+}
