@@ -14,7 +14,7 @@ extern "C"
 {
 #endif
 
-#define T3D_VERTEX_CACHE_SIZE 70
+#define T3D_VERTEX_CACHE_SIZE 69
 
 #define T3D_LIB_VER_MAJOR 1
 #define T3D_LIB_VER_MINOR 0
@@ -25,8 +25,8 @@ extern uint32_t T3D_RSP_ID;
 // RSP commands, must match with the commands defined in `rsp/rsp_tiny3d.rspl`
 enum T3DCmd {
   T3D_CMD_TRI_DRAW     = 0x0,
-  T3D_CMD_SCREEN_SIZE  = 0x1,
-  T3D_CMD_MATRIX_STACK = 0x2,
+  T3D_CMD_MATRIX_STACK = 0x1,
+  T3D_CMD_SCREEN_SIZE  = 0x2,
   T3D_CMD_SET_WORD     = 0x3,
   T3D_CMD_VERT_LOAD    = 0x4,
   T3D_CMD_LIGHT_SET    = 0x5,
@@ -37,10 +37,43 @@ enum T3DCmd {
   T3D_CMD_TRI_SYNC     = 0xA,
   T3D_CMD_TRI_STRIP    = 0xB,
   T3D_CMD_TRI_SEQ      = 0xC,
-  //                   = 0xD,
-  //                   = 0xE,
-  //                   = 0xF,
+  // rdpq fixups executed in place by the ucode (see t3d_rdpq_redirect_begin)
+  T3D_CMD_RDPQ_COMBINE_1PASS = 0xD,
+  T3D_CMD_RDPQ_COMBINE_2PASS = 0xE,
+  T3D_CMD_RDPQ_BLENDING      = 0xF,
+  T3D_CMD_RDPQ_FOG           = 0x10,
+  T3D_CMD_RDPQ_MODIFY_SOM    = 0x11,
+  T3D_CMD_RDPQ_PRIM_COLOR    = 0x12,
+  T3D_CMD_RDPQ_SCISSOR       = 0x13,
+  T3D_CMD_VERT_LOAD_IMPL     = 0x14, // internal, never emitted by the CPU
+  T3D_CMD_COUNT              = 0x15,
 };
+
+// rdpq fixup redirect table (see rdpq_fixup_redirect_begin), filled by t3d_init
+extern uint32_t T3D_RDPQ_REDIRECT[];
+
+/**
+ * Makes the rdpq render mode, prim color and scissor functions emit tiny3d commands,
+ * which the tiny3d ucode executes in place, avoiding a switch to the rdpq overlay.
+ * 't3d_model_draw' already does this around its materials; use it around your own
+ * rdpq mode calls in between tiny3d draws, and end it with 't3d_rdpq_redirect_end'.
+ *
+ * Only active while recording a rspq block: there the texture loads and colors never
+ * reach the RSP, so no overlay switch is left. Outside blocks those still need the
+ * rdpq overlay, so the whole material is left to rdpq.
+ */
+inline static void t3d_rdpq_redirect_begin(void) {
+  if(rspq_block_is_recording()) {
+    rdpq_fixup_redirect_begin(T3D_RDPQ_REDIRECT);
+  }
+}
+
+/**
+ * Ends a 't3d_rdpq_redirect_begin' section.
+ */
+inline static void t3d_rdpq_redirect_end(void) {
+  rdpq_fixup_redirect_end();
+}
 
 // Internal vertex format, interleaves two vertices
 typedef struct {
@@ -472,8 +505,8 @@ void t3d_matrix_set_proj(const T3DMat4FP *mat);
  * Loads a vertex buffer with a given size, this can then be used to draw triangles.
  *
  * @param vertices vertex buffer
- * @param offset offset in the target buffer (0-68)
- * @param count how many vertices to load (1-70)
+ * @param offset offset in the target buffer (0 to T3D_VERTEX_CACHE_SIZE-2)
+ * @param count how many vertices to load (1 to T3D_VERTEX_CACHE_SIZE)
  */
 void t3d_vert_load(const T3DVertPacked *vertices, uint32_t offset, uint32_t count);
 
@@ -642,8 +675,7 @@ void t3d_state_set_vertex_fx_scale(uint16_t scale);
  * The process is not particularly expensive, but still a lot more than other settings.
  * It should not be used on a per-material basis, but rather as a global setting you set once per scene or draw layer.
  *
- * Since the ucode is only refreshed on the next ucode switch, you have to make sure this happens before any draws.
- * This can be done by making sure that after this call, and before the next vertex load, any RDPQ call was made.
+ * The patch is applied by the RSP in order with the other commands, so it takes effect for the next vertex load.
  *
  * @param mode additive, multiplicative, or plain lighting; multiplicative by default
  */
@@ -660,8 +692,7 @@ void t3d_state_set_lighting_mode(enum T3DLightingMode mode);
  * The process is not particularly expensive, but still a lot more than other settings.
  * It should not be used on a per-material basis, but rather as a global setting you set once per scene or draw layer.
  *
- * Since the ucode is only refreshed on the next ucode switch, you have to make sure this happens before any draws.
- * This can be done by making sure that after this call, and before the next vertex load, any RDPQ call was made.
+ * The patch is applied by the RSP in order with the other commands, so it takes effect for the next triangles.
  *
  * @param invert true to cull the opposite side, false for the default winding order
  */

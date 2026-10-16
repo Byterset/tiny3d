@@ -1,0 +1,136 @@
+/**
+ * tiny3d material page: not a rspq overlay, but the code that the main overlay pages into
+ * its IMEM window (see t3d_page.h) when a paged command is executed. It holds the t3d
+ * commands that do not fit in the resident code (screen size, patch, render mode); the rdpq
+ * fixup handlers come from rsp_rdpq.inc, included by the wrapper rsp_t3d_material.S.
+ *
+ * Generated with `rspl --no-rspq=include`: no overlay header, no state,
+ * just the functions in this order. The DMEM labels are aliased by the wrapper from rsp_tiny3d.h.
+ *
+ * T3D_PAGE_CODE_START must stay the first function: it is the clip trampoline at the start
+ * of the window, which RDPQ_Triangle_Clip jumps to.
+ */
+#include "t3d_page.h"
+
+state {
+  // main overlay state (rsp_tiny3d.rspl)
+  extern u32 UCODE_BUF_ADDR;
+  extern u8  PAGE_STATE;
+  extern u16 SCREEN_SCALE;
+  extern u32 SCREEN_OFFSET;
+  extern u16 NORM_SCALE_W;
+  extern u16 SCREEN_UVGEN_SCALE;
+  extern u8  FACE_CULLING;
+  extern u32 TRI_COMMAND;
+  extern u8  CLIP_BUFFER_TMP;
+  // libdragon labels
+  extern u32 RDPQ_OTHER_MODES;
+  extern u16 RSPQ_Loop;
+  extern u16 RSPQ_SCRATCH_MEM;
+  extern u16 CLIPPING_CODE_TARGET;
+}
+
+function DMAIn(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
+function DMAInAsync(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
+function DMAOut(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
+
+/**
+ * Clip trampoline: loads the clipping code over this page ($s4 = CLIPPING_CODE_TARGET is set
+ * by RDPQ_Triangle_Clip). Restores the command table pointing to T3D_PageLoad first, as the
+ * page is evicted.
+ */
+@NoReturn
+function T3D_PAGE_CODE_START()
+{
+  u32<$s0> rdram = load(UCODE_BUF_ADDR);
+  s16<$s4> dmem = T3D_TABLES_DMEM;
+  u16<$t0> size = T3D_TABLES_SIZE - 1;
+  rdram += T3D_BUF_TABLES_OFF;
+  DMAInAsync(size, rdram, dmem);
+
+  rdram = load(UCODE_BUF_ADDR);
+  rdram += T3D_BUF_CLIP_OFF;
+  dmem = CLIPPING_CODE_TARGET;
+  size = T3D_WINDOW_SIZE - 1;
+
+  u8 pageState = T3D_PAGE_CLIP;
+  store(pageState, PAGE_STATE);
+
+  RA = CLIPPING_CODE_TARGET;
+  goto DMAIn;
+}
+
+/**
+ * Sets the screen size & guard-band (command 2 of rsp_tiny3d.rspl).
+ * @param guardBandFactor u8 with the guard multiplier (should be 1-4)
+ * @param screenScale screen-size * 2
+ * @param depthAndWScale fractional 16bit scales to normalize W and depth
+ */
+command<2> T3DCmd_SetScreenSize(
+  s8 guardBandFactor, u32 screenOffsetXY, u32 screenScaleXY, u32 depthAndWScale,
+  u32<$t4> screenScaleXYFrac, u32<$t5> depthScaleFrac
+)
+{
+  // scale is s16.16 (SCREEN_SCALE layout: int x,y,z,w | fract x,y,z,w)
+  // Only the z lane is written here: the w lanes of SCREEN_SCALE / SCREEN_OFFSET hold the fog
+  // slope/offset (t3d_fog_set_range) and must survive viewport changes.
+  u32 zScaleInt = depthAndWScale >> 16;
+  store(zScaleInt:u16, SCREEN_SCALE, 0x04);      // z int scale
+  store(screenScaleXY, SCREEN_SCALE, 0x00);      // x/y int scale
+  store(screenOffsetXY, SCREEN_OFFSET, 0x00);
+  store(screenScaleXYFrac, SCREEN_SCALE, 0x08);
+  u32 zScaleFrac = depthScaleFrac >> 16;
+  store(zScaleFrac:u16, SCREEN_SCALE, 0x0C);     // z fract scale
+
+  store(depthAndWScale:s16, NORM_SCALE_W, 6);
+
+  u16 uvgenScaleFactor = guardBandFactor >> 8;
+  store(uvgenScaleFactor, SCREEN_UVGEN_SCALE);
+}
+
+/**
+ * Patches an 8-byte instruction pair in the RDRAM copy of the ucode and in IMEM
+ * (command 8 of rsp_tiny3d.rspl). The IMEM write is skipped if the target lies in the
+ * paged window, which is restored from the patched RDRAM copy before being used again.
+ *
+ * @param rdramAddr_ RDRAM address of the instruction pair (in the ucode buffer)
+ * @param opcode0/1 new instruction pair
+ * @param imemAddr IMEM address of the instruction pair
+ */
+@NoReturn
+command<8> T3DCmd_Patch(u32 rdramAddr_, u32 opcode0, u32 opcode1, u32 imemAddr) {
+    u16<$t0> size = 8 - 1;
+    u32<$s0> rdramAddr = rdramAddr_;
+    s16<$s4> dmemAddr = RSPQ_SCRATCH_MEM;
+
+    store(opcode0, dmemAddr, 0);
+    store(opcode1, dmemAddr, 4);
+
+    DMAOut(size, rdramAddr, dmemAddr);
+
+    u32 windowOffset = CLIPPING_CODE_TARGET;
+    windowOffset = imemAddr - windowOffset;
+    if(windowOffset < T3D_WINDOW_SIZE)goto RSPQ_Loop;
+
+    size = 8 - 1;
+    rdramAddr = rdramAddr_;
+    dmemAddr = imemAddr;
+    RA = RSPQ_Loop;
+    goto DMAIn;
+}
+
+/**
+ * Sets various render-mode settings (command 6 of rsp_tiny3d.rspl).
+ * @param culling for RDPQ_Triangle, 0=front, 1=back, >1=none
+ * @param triCommand for RDPQ_Triangle
+ */
+command<6> T3DCmd_RenderMode(u8 culling, u32 triCommand) {
+  store(culling, FACE_CULLING);
+
+  // Mipmap setting (pulled out from RDPQ_Triangle)
+  u8 mipmap = load(RDPQ_OTHER_MODES);
+  mipmap &= 0x38;
+  triCommand |= mipmap;
+
+  store(triCommand, TRI_COMMAND);
+}

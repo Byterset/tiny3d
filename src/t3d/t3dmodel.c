@@ -385,6 +385,8 @@ void t3d_model_draw_material(T3DMaterial *mat, T3DModelState *state)
   // and only need to happen before a `t3d_tri_draw` call
   if(mat->colorCombiner)
   {
+    t3d_rdpq_redirect_begin();
+
     bool setBlendMode  = state->lastBlendMode != mat->blendMode;
     bool setCC         = mat->colorCombiner != state->lastCC;
     bool setTexture    = state->lastTextureHashA != mat->textureA.textureHash || state->lastTextureHashB != mat->textureB.textureHash;
@@ -399,13 +401,16 @@ void t3d_model_draw_material(T3DMaterial *mat, T3DModelState *state)
       state->lastTextureHashA = mat->textureA.textureHash;
       state->lastTextureHashB = mat->textureB.textureHash;
 
-      rdpq_tex_multi_begin();
+      // CPU-side TMEM layout: avoids the auto-TMEM fixups, which need the rdpq overlay
+      rdpq_tex_multi_begin_cpu();
         set_texture(mat, TILE0, state->drawConf);
         set_texture(mat, TILE1, state->drawConf);
       rdpq_tex_multi_end();
     }
 
-    rdpq_mode_begin();
+    // 'rdpq_mode_end' always re-emits the full render mode, so skip it if nothing changed
+    bool setMode = setCC || setBlendMode || setOtherMode;
+    if(setMode)rdpq_mode_begin();
 
     if(setCC) {
       state->lastCC = mat->colorCombiner;
@@ -445,7 +450,8 @@ void t3d_model_draw_material(T3DMaterial *mat, T3DModelState *state)
       }
     }
 
-    rdpq_mode_end();
+    if(setMode)rdpq_mode_end();
+    t3d_rdpq_redirect_end();
   }
 
   if(mat->renderFlags != state->lastRenderFlags) {

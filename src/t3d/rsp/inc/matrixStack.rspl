@@ -85,7 +85,7 @@ function normalizeMatrixVector(u32<$s4> addrIn, u32<$t1> addrOut)
  *                     byte 3  : flags (1=mul, 2=only advance)
  * @param addressMat RDRAM address to load matrix from
  */
-command<2> T3DCmd_MatrixStack(s32 stackAdvance, u32 addressMat)
+command<1> T3DCmd_MatrixStack(s32 stackAdvance, u32 addressMat)
 {
   u32<$s4> dmaDest;
 

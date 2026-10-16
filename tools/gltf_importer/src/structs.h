@@ -291,7 +291,7 @@ namespace T3DM
     )> materialWriter{};
   };
 
-  constexpr int MAX_VERTEX_COUNT = 70;
+  constexpr int MAX_VERTEX_COUNT = 69; // must match T3D_VERTEX_CACHE_SIZE in t3d.h
   constexpr int CACHE_VERTEX_SIZE = 36;
   constexpr u8 T3DM_VERSION = 0x04;
 

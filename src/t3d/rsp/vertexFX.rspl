@@ -39,7 +39,7 @@ function VertexFX_CelShadeColor(
   color = max(color, color.zzzzZZZZ);
   uv.x = color.x;
   uv.z = color.X;
-  goto VertexFX_None;
+  goto LOOP_TRAIL;
 }
 
 function VertexFX_CelShadeAlpha(
@@ -50,8 +50,8 @@ function VertexFX_CelShadeAlpha(
 {
   uv.x = color.w;
   uv.z = color.W;
-  
-  goto VertexFX_None;
+
+  goto LOOP_TRAIL;
 }
 
 function VertexFX_Outline(

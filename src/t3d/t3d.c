@@ -4,7 +4,11 @@
 */
 #include <t3d/t3d.h>
 #include "rsp/rsp_tiny3d.h"
+#include "rsp/rsp_t3d_material.h"
+#include "rsp/t3d_page.h"
 #include <rspq_profile.h>
+#include <rspq_constants.h>
+#include <rdpq_constants.h>
 
 #ifndef RDPQ_WRITE_COUNT_UNKNOWN
   #define RDPQ_WRITE_COUNT_UNKNOWN -1
@@ -37,9 +41,35 @@ static_assert(RSP_T3D_BSS_CLIP_BUFFER_TMP + 2 * 176 <= RSP_T3D_BSS_CLIP_BUFFER_R
 static_assert(RSP_T3D_CODE_TAG_CullFlipA < RSP_T3D_CODE_CLIPPING_CODE_TARGET, "Cull-Flip-A must come before the clipping code!");
 static_assert(RSP_T3D_CODE_TAG_CullFlipB < RSP_T3D_CODE_CLIPPING_CODE_TARGET, "Cull-Flip-B must come before the clipping code!");
 
+// paged IMEM window (see t3d_page.h)
+static_assert(RSP_T3D_CODE_T3D_WINDOW_END % 8 == 0, "Paged window must end at an 8-byte boundary!");
+static_assert(RSP_T3D_CODE_T3D_WINDOW_END - RSP_T3D_CODE_CLIPPING_CODE_TARGET == T3D_WINDOW_SIZE, "T3D_WINDOW_SIZE (t3d_page.h) must match the size of the paged window (vertex loading code)!");
+static_assert(T3D_WINDOW_SIZE <= T3D_WINDOW_MAX_SIZE, "Paged window exceeds the slot size of the ucode buffer!");
+static_assert(RSP_T3D_CODE_CLIP_clipTriangle == RSP_T3D_CODE_CLIPPING_CODE_TARGET, "Clipping code must start at the paged window!");
+static_assert(RSP_T3D_CODE_CLIP_OVERLAY_CODE_END <= RSP_T3D_CODE_T3D_WINDOW_END, "Clipping code must fit in the paged window!");
+static_assert(RSP_T3D_MAT_CODE_T3D_PAGE_CODE_START == RSP_T3D_CODE_CLIPPING_CODE_TARGET, "Material page must start at the paged window!");
+static_assert(RSP_T3D_MAT_CODE__text_end <= RSP_T3D_CODE_T3D_WINDOW_END, "Material page code must fit in the paged window!");
+static_assert(RSP_T3D_MAT_RDPQ_CMD_PTR == RSP_T3D_BSS_CLIP_BUFFER_TMP, "Material page data must start at the temp area of the main overlay!");
+static_assert(RSP_T3D_MAT__data_end - RSP_T3D_BSS_CLIP_BUFFER_TMP <= T3D_PAGE_DATA_SIZE, "Material page data exceeds T3D_PAGE_DATA_SIZE!");
+static_assert(RSP_T3D_MAT_BSS_RDPQ_CMD_STAGING + 0xB0 <= 0xA4001000, "Material page scratch data exceeds DMEM!");
+static_assert(RSP_T3D_MAT_BSS_RDPQ_MODE_COMBINER_2CYC + 8 <= 0xA4001000, "Material page scratch data exceeds DMEM!");
+// swapped command table entries (T3D_TABLES_DMEM): must cover all paged commands (index >= 2)
+static_assert((RSP_T3D__RSPQ_OVERLAY_COMMAND_TABLE & 0xFFF) == 0x200 + RSPQ_OVERLAY_HEADER_SIZE, "Unexpected overlay command table address!");
+static_assert((RSP_T3D__RSPQ_OVERLAY_COMMAND_TABLE & 0xFFF) + 2*2 >= T3D_TABLES_DMEM, "T3D_TABLES_DMEM must not cover the first two commands!");
+static_assert((RSP_T3D__RSPQ_OVERLAY_COMMAND_TABLE & 0xFFF) + 2*2 < T3D_TABLES_DMEM + 8, "T3D_TABLES_DMEM must start at the 3rd command (rounded down to 8 bytes)!");
+static_assert((RSP_T3D__RSPQ_OVERLAY_COMMAND_TABLE & 0xFFF) + 2*T3D_CMD_COUNT <= T3D_TABLES_DMEM + T3D_TABLES_SIZE, "The command table must end within the swapped tables!");
+static_assert((RSP_T3D_STATE_MEM_START & 0xFFF) >= T3D_TABLES_DMEM + T3D_TABLES_SIZE, "The swapped tables must not overlap the saved state!");
+
 DEFINE_RSP_UCODE(rsp_tiny3d);
 DEFINE_RSP_UCODE(rsp_tiny3d_clipping);
+DEFINE_RSP_UCODE(rsp_t3d_material);
 uint32_t T3D_RSP_ID = 0;
+uint32_t T3D_RDPQ_REDIRECT[RDPQ_FIXUP_REDIRECT_COUNT] = {0};
+
+// RDRAM buffer with everything the ucode pages (layout in t3d_page.h)
+static uint8_t *ucodeBuf = NULL;
+static uint8_t *ucodeOrgCode = NULL; // original rsp_tiny3d.code / code_end, restored by t3d_destroy
+static void *ucodeOrgCodeEnd = NULL;
 
 #define MAX(a,b) (a) > (b) ? (a) : (b)
 #define MIN(a,b) (a) < (b) ? (a) : (b)
@@ -50,11 +80,30 @@ uint32_t T3D_RSP_ID = 0;
 
 static T3DViewport *currentViewport = NULL;
 static T3DMat4FP *matrixStack = NULL;
-static uint32_t clipCodeAddrOrg = 0; // 'CLIP_CODE_ORG_ADDR' in ucode
+static uint32_t ucodeBufAddr = 0; // 'UCODE_BUF_ADDR' in ucode (physical address of ucodeBuf)
 
 static uint64_t orgInstrLightMul = 0; // backup of the 8-byte pair containing the lighting mul. instruction
 static uint64_t orgInstrCullFlipA = 0; // backup
 static uint64_t orgInstrCullFlipB = 0; // backup
+
+/**
+ * Points an entry of the "loaded" command table to a handler of the material page.
+ * @param tables     copy of the DMEM range [T3D_TABLES_DMEM, +T3D_TABLES_SIZE)
+ * @param entryDmem  DMEM address of the table entry
+ * @param handler    IMEM address of the handler (from rsp_t3d_material.h)
+ * @param size       size of the command in bytes (must match the resident entry)
+ */
+static void t3d_page_set_entry(uint16_t *tables, uint32_t entryDmem, uint32_t handler, uint32_t size)
+{
+  assertf(entryDmem >= T3D_TABLES_DMEM && entryDmem + 2 <= T3D_TABLES_DMEM + T3D_TABLES_SIZE,
+    "paged command entry %04lX outside of the swapped tables", entryDmem);
+  // same format as RSPQ_DefineCommand in rsp_queue.inc
+  uint16_t desc = (uint16_t)(((handler & 0xFFF) >> 2) | ((size & 0xFC) << 8));
+  uint16_t *entry = &tables[(entryDmem - T3D_TABLES_DMEM) / 2];
+  assertf(*entry != 0 && (*entry & 0xFC00) == (desc & 0xFC00),
+    "paged command entry %04lX: size mismatch with the resident table (%04X vs %04X)", entryDmem, *entry, desc);
+  *entry = desc;
+}
 
 void t3d_init(T3DInitParams params)
 {
@@ -72,22 +121,67 @@ void t3d_init(T3DInitParams params)
   uint16_t *uvGenFunc = (uint16_t*)((char*)state + ((RSP_T3D_VERTEX_FX_FUNC - RSP_T3D_STATE_MEM_START) & 0xFFFF));
   *uvGenFunc = RSP_T3D_CODE_LOOP_TRAIL & 0xFFF;
 
-  clipCodeAddrOrg = (uint32_t)PhysicalAddr(rsp_tiny3d.code + (RSP_T3D_CODE_CLIPPING_CODE_TARGET & 0xFFF));
-
-  // set the address for the clipping ucode from the other overlay, and that of the main one.
-  // this is used to lazy-load a new section of IMEM if clipping is needed, and switch back afterward.
-  uint32_t *clipAddrPtr = (uint32_t*)((char*)state + ((RSP_T3D_CLIP_CODE_ADDR - RSP_T3D_STATE_MEM_START) & 0xFFFF));
-  uint16_t *clipSizePtr = (uint16_t*)((char*)state + ((RSP_T3D_CLIP_CODE_SIZE - RSP_T3D_STATE_MEM_START) & 0xFFFF));
-  clipAddrPtr[0] = (uint32_t)PhysicalAddr(rsp_tiny3d_clipping.code + (RSP_T3D_CODE_CLIP_clipTriangle & 0xFFF));
-  clipAddrPtr[1] = clipCodeAddrOrg;
-  *clipSizePtr = RSP_T3D_CODE_CLIP_OVERLAY_CODE_END - RSP_T3D_CODE_CLIP_clipTriangle + 7;
-
   orgInstrLightMul = *(uint64_t*)(rsp_tiny3d.code + (RSP_T3D_CODE_TAG_LightMul & 0x0FF8));
 
   orgInstrCullFlipA = *(uint64_t*)(rsp_tiny3d.code + (RSP_T3D_CODE_TAG_CullFlipA & 0x0FF8));
   orgInstrCullFlipB = *(uint64_t*)(rsp_tiny3d.code + (RSP_T3D_CODE_TAG_CullFlipB & 0x0FF8));
 
+  // Build the ucode buffer (see t3d_page.h). The overlay runs from the text copy in it,
+  // so that T3DCmd_Patch and the window restore use the same bytes.
+  const uint32_t windowOffset = RSP_T3D_CODE_CLIPPING_CODE_TARGET & 0xFFF;
+  const uint32_t windowSize = RSP_T3D_CODE_T3D_WINDOW_END - RSP_T3D_CODE_CLIPPING_CODE_TARGET;
+  const uint32_t codeSize = (uint8_t*)rsp_tiny3d.code_end - rsp_tiny3d.code;
+  assertf(codeSize <= T3D_BUF_CLIP_OFF - T3D_BUF_TEXT_OFF, "tiny3d ucode text too large for the ucode buffer (%lu)", codeSize);
+
+  ucodeOrgCode = rsp_tiny3d.code;
+  ucodeOrgCodeEnd = rsp_tiny3d.code_end;
+  ucodeBuf = malloc_uncached(T3D_BUF_SIZE);
+  memset(ucodeBuf, 0, T3D_BUF_SIZE);
+  memcpy(ucodeBuf + T3D_BUF_TEXT_OFF, rsp_tiny3d.code, codeSize);
+  // clip / page slots are pre-filled with the window code, as they are loaded as a whole window
+  memcpy(ucodeBuf + T3D_BUF_CLIP_OFF, rsp_tiny3d.code + windowOffset, windowSize);
+  memcpy(ucodeBuf + T3D_BUF_CLIP_OFF, rsp_tiny3d_clipping.code + windowOffset,
+    RSP_T3D_CODE_CLIP_OVERLAY_CODE_END - RSP_T3D_CODE_CLIP_clipTriangle);
+  memcpy(ucodeBuf + T3D_BUF_PAGE_OFF, rsp_tiny3d.code + windowOffset, windowSize);
+  memcpy(ucodeBuf + T3D_BUF_PAGE_OFF, rsp_t3d_material.code + windowOffset,
+    (RSP_T3D_MAT_CODE__text_end & 0xFFF) - windowOffset);
+  memcpy(ucodeBuf + T3D_BUF_CONSTS_OFF, rsp_t3d_material.data + (RSP_T3D_BSS_CLIP_BUFFER_TMP & 0xFFF),
+    RSP_T3D_MAT__data_end - RSP_T3D_BSS_CLIP_BUFFER_TMP);
+
+  // command tables: as assembled, and with the paged commands pointing into the material page
+  memcpy(ucodeBuf + T3D_BUF_TABLES_OFF, rsp_tiny3d.data + T3D_TABLES_DMEM, T3D_TABLES_SIZE);
+  memcpy(ucodeBuf + T3D_BUF_TABLES_PAGE_OFF, rsp_tiny3d.data + T3D_TABLES_DMEM, T3D_TABLES_SIZE);
+  uint16_t *tablesPage = (uint16_t*)(ucodeBuf + T3D_BUF_TABLES_PAGE_OFF);
+  const uint32_t cmdTable = RSP_T3D__RSPQ_OVERLAY_COMMAND_TABLE & 0xFFF;
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_SCREEN_SIZE*2, RSP_T3D_MAT_CODE_T3DCmd_SetScreenSize, 24);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_DRAWFLAGS*2, RSP_T3D_MAT_CODE_T3DCmd_RenderMode, 8);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_PATCH*2, RSP_T3D_MAT_CODE_T3DCmd_Patch, 16);
+  // rdpq fixups (handlers of rsp_rdpq.inc, sizes as in rsp_rdpq.S)
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_COMBINE_1PASS*2, RSP_T3D_MAT_CODE_RDPQ_SetCombineMode_1Pass, 16);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_COMBINE_2PASS*2, RSP_T3D_MAT_CODE_RDPQ_SetCombineMode_2Pass, 8);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_BLENDING*2, RSP_T3D_MAT_CODE_RDPQ_SetBlendingMode, 8);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_FOG*2, RSP_T3D_MAT_CODE_RDPQ_SetFogMode, 8);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_MODIFY_SOM*2, RSP_T3D_MAT_CODE_RDPQCmd_ModifyOtherModes, 12);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_PRIM_COLOR*2, RSP_T3D_MAT_CODE_RDPQCmd_SetPrimColorComponent, 8);
+  t3d_page_set_entry(tablesPage, cmdTable + T3D_CMD_RDPQ_SCISSOR*2, RSP_T3D_MAT_CODE_RDPQCmd_SetScissorEx, 8);
+
+  // register the overlay with the text copy in the buffer
+  rsp_tiny3d.code = ucodeBuf + T3D_BUF_TEXT_OFF;
+  rsp_tiny3d.code_end = ucodeBuf + T3D_BUF_TEXT_OFF + codeSize;
+  ucodeBufAddr = (uint32_t)PhysicalAddr(ucodeBuf);
+  uint32_t *bufAddrPtr = (uint32_t*)((char*)state + ((RSP_T3D_UCODE_BUF_ADDR - RSP_T3D_STATE_MEM_START) & 0xFFFF));
+  *bufAddrPtr = ucodeBufAddr;
+
   T3D_RSP_ID = rspq_overlay_register(&rsp_tiny3d);
+
+  // rdpq fixups emitted as tiny3d commands while redirected (see t3d_rdpq_redirect_begin)
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_SET_COMBINE_MODE_1PASS]   = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_COMBINE_1PASS);
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_SET_COMBINE_MODE_2PASS]   = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_COMBINE_2PASS);
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_SET_BLENDING_MODE]        = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_BLENDING);
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_SET_FOG_MODE]             = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_FOG);
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_MODIFY_OTHER_MODES]       = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_MODIFY_SOM);
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_SET_PRIM_COLOR_COMPONENT] = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_PRIM_COLOR);
+  T3D_RDPQ_REDIRECT[RDPQ_CMD_SET_SCISSOR_EX]           = RDPQ_FIXUP_REDIRECT(T3D_RSP_ID, T3D_CMD_RDPQ_SCISSOR);
 }
 
 void t3d_destroy(void)
@@ -99,6 +193,14 @@ void t3d_destroy(void)
   {
     free_uncached(matrixStack);
     matrixStack = NULL;
+  }
+
+  if(ucodeBuf)
+  {
+    free_uncached(ucodeBuf);
+    ucodeBuf = NULL;
+    rsp_tiny3d.code = ucodeOrgCode;
+    rsp_tiny3d.code_end = ucodeOrgCodeEnd;
   }
 
   currentViewport = NULL;
@@ -128,8 +230,8 @@ inline static void t3d_dmem_set_u16(uint32_t addr, uint32_t value) {
   rspq_write(T3D_RSP_ID, T3D_CMD_SET_WORD, addr | 0x8000, value);
 }
 
-inline static void t3d_imem_patch(void* rdram, uint32_t opcode0, uint32_t opcode1) {
-  rspq_write(T3D_RSP_ID, T3D_CMD_PATCH, PhysicalAddr(rdram), opcode0, opcode1);
+inline static void t3d_imem_patch(void* rdram, uint32_t opcode0, uint32_t opcode1, uint32_t imemAddr) {
+  rspq_write(T3D_RSP_ID, T3D_CMD_PATCH, PhysicalAddr(rdram), opcode0, opcode1, imemAddr);
 }
 
 /// @brief Fetches the original instruction at a tag out of its backed up 8-byte pair
@@ -147,7 +249,8 @@ inline static void t3d_imem_patch_instr(uint32_t tagAddr, uint64_t orgPair, uint
 
   t3d_imem_patch(
     rsp_tiny3d.code + (tagAddr & 0x0FF8),
-    (uint32_t)(pair >> 32), (uint32_t)pair
+    (uint32_t)(pair >> 32), (uint32_t)pair,
+    (tagAddr & 0x0FF8) | 0x1000
   );
 }
 
@@ -369,9 +472,9 @@ void t3d_state_set_depth_offset(int16_t offset) {
 }
 
 void t3d_state_set_alpha_to_tile(bool enable) {
-  t3d_dmem_set_u32((RSP_T3D_CLIP_CODE_ORG_ADDR & 0xFFF),
+  t3d_dmem_set_u32((RSP_T3D_UCODE_BUF_ADDR & 0xFFF),
       // store mask that will select or discard the 3 MSBs of the vertex alpha
-     clipCodeAddrOrg | (enable ? (0b111 << (32-3)) : 0)
+     ucodeBufAddr | (enable ? (0b111 << (32-3)) : 0)
   );
 }
 
@@ -599,11 +702,13 @@ void t3d_viewport_attach(T3DViewport *viewport) {
   }
 
   // Limit draw region
+  t3d_rdpq_redirect_begin();
   rdpq_set_scissor(
     viewport->offset[0], viewport->offset[1],
     viewport->offset[0] + viewport->size[0],
     viewport->offset[1] + viewport->size[1]
   );
+  t3d_rdpq_redirect_end();
 
   uint16_t normWScale = (uint16_t)roundf(0xFFFF * fminf(currentViewport->_normScaleW, 1.0f));
   float normWScaleFloat = (float)normWScale * (1.0f / 0xFFFF);

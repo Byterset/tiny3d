@@ -11,8 +11,21 @@
  * @license MIT                        *
  ***************************************/
 
-#define VERT_BUFFER_COUNT 70
+/**
+ * rsp_tiny3d.S and rsp_tiny3d_clipping.S are generated from this file.
+ *
+ * Paged IMEM window (see t3d_page.h):
+ *  - the window [CLIPPING_CODE_TARGET, T3D_WINDOW_END) holds the vertex loading code and can
+ *    be overwritten by the clipping code or the material page (rsp_t3d_material.rspl).
+ *  - paged commands (screen size, render mode, patch, rdpq fixups) only jump to T3D_PageLoad,
+ *    which loads the page and the command table pointing into it, then re-runs the command.
+ *  - T3DCmd_VertLoad and T3DCmd_TriSync restore the window if something else is loaded.
+ */
+
+#define VERT_BUFFER_COUNT 69
 #define LIGHT_COUNT 7
+
+#include "t3d_page.h"
 
 // with profiling enabled, manually place the data to avoid corruption
 #define RSPQ_PROFILE_MANUAL_SLOT 1
@@ -74,6 +87,7 @@ state
   extern u16 RSPQ_SCRATCH_MEM;
   extern u16 CLIPPING_CODE_TARGET;
   extern u16 T3DCmd_TriDraw_End;
+  extern u16 T3D_WINDOW_END; // end of the paged IMEM window
 
   alignas(8) vec16 MATRIX_PROJ[4];   // projection matrix
   alignas(8) vec16 MATRIX_MVP[4];    // view * model * projection
@@ -147,17 +161,16 @@ state
   // Note: accessed byte-wide (lbu/sb), must stay u8 (the shipped .S layout depends on it)
   u8 FOG_STORE_OFFSET = {TRI_SIZE_2}; // offset (relative to current vertex) where to store fog, set to 72 for no fog
   u8 ACTIVE_LIGHT_SIZE = {0}; // light count * light size
-  u8 _UNUSED_ = {0};
+  u8 _UNUSED_ = {0}; // overwritten by the u16 CPU write of ACTIVE_LIGHT_SIZE
 
   u16 VERTEX_FX_FUNC = {0}; // points top the current 'VertexFX_' function in IMEM
-  u16 CLIP_CODE_SIZE = {0}; // size to copy
+  // what is loaded in the paged IMEM window (T3D_PAGE_*), accessed as a byte but
+  // must not share a half-word with anything the CPU writes with t3d_dmem_set_u16
+  u16 PAGE_STATE = {0};
 
-    // address of the clipping code to load in RDRAM
-  // first byte (MSB) stores if th code is already loaded or not
-  u32 CLIP_CODE_ADDR = {0};
-  // address of the original code (this overlay here)
+  // RDRAM address of the ucode buffer (see t3d_page.h)
   // first byte (MSB) stores a mask used for the alpha-to-tile feature
-  u32 CLIP_CODE_ORG_ADDR = {0};
+  u32 UCODE_BUF_ADDR = {0};
 
    /**
    * Buffer format (RDPQ_Triangle compatible):
@@ -203,6 +216,8 @@ function RDPQ_Triangle_Send_End();
 
 function DMAExec(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
 function DMAOut(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
+function DMAIn(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
+function DMAInAsync(u16<$t0> size, u32<$s0> rdramAddr, s16<$s4> dmemAddr);
 
 macro dmaInAsync(u32 addrRDRAM, u32 addrDMEM, u32 size)
 {
@@ -270,26 +285,23 @@ macro traceEnd() { asm("andi $zero, $zero, 1"); }
   u32<$s6> ptrBuffA, u32<$s5> ptrBuffB
 );*/
 
-// marks the place where the clipping code can be loaded in to
-// This section will overwrite itself via a DMA.
-// So if the clipping code was not loaded it will be executed and finishes by jumping to itself again.
-// If loaded it will contain the clipping code and will be executed.
-// This means the triangle function can just jump here without knowing what is loaded
+// Start of the paged IMEM window. This trampoline loads the clipping code over the window
+// and jumps to it, so the triangle code can jump here without knowing what is loaded
+// (the material page starts with the same trampoline).
+// $s4 = CLIPPING_CODE_TARGET (the DMA destination) is set by RDPQ_Triangle_Clip.
 @Align(8) // DMA alignment
 @NoReturn
 function CLIPPING_CODE_TARGET()
 {
-  u32<$s4> targetImem;
-  u32<$s0> codeAddr = load(CLIP_CODE_ADDR);
-  u16<$t0> codeSize = load(CLIP_CODE_SIZE);
+  u32<$s0> codeAddr = load(UCODE_BUF_ADDR);
+  u16<$t0> codeSize = T3D_WINDOW_SIZE - 1;
+  codeAddr += T3D_BUF_CLIP_OFF;
 
-  // mark as loaded, 'codeSize' is guaranteed to be non-zero in the LSB
-  store(codeSize:u8, CLIP_CODE_ADDR);
+  u8 pageState = T3D_PAGE_CLIP;
+  store(pageState, PAGE_STATE);
 
-  //RA = CLIPPING_CODE_TARGET; // <- @TODO: RSPL auto opt
-  //goto DMAExec;
-  dma_in(targetImem, codeAddr, codeSize);
-  goto CLIPPING_CODE_TARGET;
+  RA = CLIPPING_CODE_TARGET;
+  goto DMAIn;
 }
 
 /**
@@ -301,8 +313,11 @@ function CLIPPING_CODE_TARGET()
  * @param rdramVerts RDRAM address to load vertices from
  * @param bufferSize 2 u16 DMEM addresses, MSBs set where to DMA the input to, LSBs set where to store the result
  */
+// Body of T3DCmd_VertLoad, which lives inside the paged window (T3DCmd_VertLoad restores
+// the window first). Declared as a command with an index the CPU never emits, because
+// RSPL allocates registers differently for commands and functions.
 @NoReturn // vertex FX function do return to RSPQ_Loop manually
-command<4> T3DCmd_VertLoad(u32 bufferSize, u32 rdramVerts, u32 addressInOut)
+command<20> T3DCmd_VertLoad_Impl(u32 bufferSize, u32 rdramVerts, u32 addressInOut)
 {
   // load all vertices in a single DMA, processing them as the loop goes.
   // NOTE: the input vertex-size is smaller than the internal one, so we can't do it in place.
@@ -317,7 +332,7 @@ command<4> T3DCmd_VertLoad(u32 bufferSize, u32 rdramVerts, u32 addressInOut)
   dma_in_async(prt3d, dmaAddrRDRAM, copySize);
   undef copySize;
 
-  vec32 mat0, mat1, mat2, mat3;
+  vec32<$v27> mat0; vec32<$v25> mat1; vec32<$v23> mat2; vec32<$v21> mat3;
   vec16 matN0, matN1, matN2;
 
   loadCurrentNormalMat(matN0, matN1, matN2);
@@ -379,7 +394,7 @@ command<4> T3DCmd_VertLoad(u32 bufferSize, u32 rdramVerts, u32 addressInOut)
   undef dmaAddrRDRAM;
   undef addressInOut;
 
-  u8<$s0> baseTileMask = load(CLIP_CODE_ORG_ADDR);
+  u8<$s0> baseTileMask = load(UCODE_BUF_ADDR);
   u8<$a2> baseTile;
 
   // @TODO: racing the DMA is ~40us faster, doesn't work in ares, retest later again
@@ -665,36 +680,27 @@ function loadCurrentMVPMat(vec32<$v27> mat0, vec32<$v25> mat1, vec32<$v23> mat2,
  * @param screenScale screen-size * 2
  * @param depthAndWScale fractional 16bit scales to normalize W and depth
  */
-command<1> T3DCmd_SetScreenSize(
+// (implemented in the material page, see rsp_t3d_material.rspl)
+@NoReturn
+command<2> T3DCmd_SetScreenSize(
   s8 guardBandFactor, u32 screenOffsetXY, u32 screenScaleXY, u32 depthAndWScale,
   u32<$t4> screenScaleXYFrac, u32<$t5> depthScaleFrac
 )
 {
-  // scale is s16.16 (SCREEN_SCALE layout: int x,y,z,w | fract x,y,z,w)
-  // Only the z lane is written here: the w lanes of SCREEN_SCALE / SCREEN_OFFSET hold the fog
-  // slope/offset (t3d_fog_set_range) and must survive viewport changes.
-  u32 zScaleInt = depthAndWScale >> 16;
-  store(zScaleInt:u16, SCREEN_SCALE, 0x04);      // z int scale
-  store(screenScaleXY, SCREEN_SCALE, 0x00);      // x/y int scale
-  store(screenOffsetXY, SCREEN_OFFSET, 0x00);
-  store(screenScaleXYFrac, SCREEN_SCALE, 0x08);
-  u32 zScaleFrac = depthScaleFrac >> 16;
-  store(zScaleFrac:u16, SCREEN_SCALE, 0x0C);     // z fract scale
-
-  store(depthAndWScale:s16, NORM_SCALE_W, 6);
-
-  u16 uvgenScaleFactor = guardBandFactor >> 8;
-  store(uvgenScaleFactor, SCREEN_UVGEN_SCALE);
-
-
+  goto T3D_PageLoad;
 }
 
 /**
  * Enables or disables fog.
  * @param enabled 1=enabled, 0=disabled
+ *
+ * First function after the paged IMEM window, T3D_WINDOW_END marks its end (8-byte aligned,
+ * the window size must match T3D_WINDOW_SIZE in t3d_page.h).
  */
+@Align(8)
 command<9> T3DCmd_SetFogState(u8 enabled)
 {
+  asm("T3D_WINDOW_END:");
   store(enabled, FOG_STORE_OFFSET);
 }
 
@@ -722,15 +728,10 @@ command<5> T3DCmd_LightSet(u32 addr, u32 rgba8, u32 dirXYZ0, u32 dirXYZ1)
  * @param culling for RDPQ_Triangle, 0=front, 1=back, >1=none
  * @param triCommand for RDPQ_Triangle
  */
+// (implemented in the material page, see rsp_t3d_material.rspl)
+@NoReturn
 command<6> T3DCmd_RenderMode(u8 culling, u32 triCommand) {
-  store(culling, FACE_CULLING);
-
-  // Mipmap setting (pulled out from RDPQ_Triangle)
-  u8 mipmap = load(RDPQ_OTHER_MODES);
-  mipmap &= 0x38;
-  triCommand |= mipmap;
-
-  store(triCommand, TRI_COMMAND);
+  goto T3D_PageLoad;
 }
 
 #define HAS_NORMAL_MATRIX 1
@@ -762,45 +763,123 @@ command<3> T3DCmd_SetWord(u16 addrDMEM, u32 value) {
 }
 
 /**
+ * rdpq fixups executed in place by the material page (handlers of rsp_rdpq.inc), emitted
+ * by rdpq while redirected (see t3d_rdpq_redirect_begin).
+ * The argument counts must match the command sizes in rsp_rdpq.S.
+ */
+@NoReturn
+command<13> T3DCmd_RdpqCombine1Pass(u32 a, u32 b, u32 c, u32 d) { goto T3D_PageLoad; }
+@NoReturn
+command<14> T3DCmd_RdpqCombine2Pass(u32 a, u32 b) { goto T3D_PageLoad; }
+@NoReturn
+command<15> T3DCmd_RdpqBlending(u32 a, u32 b) { goto T3D_PageLoad; }
+@NoReturn
+command<16> T3DCmd_RdpqFog(u32 a, u32 b) { goto T3D_PageLoad; }
+@NoReturn
+command<17> T3DCmd_RdpqModifySOM(u32 a, u32 b, u32 c) { goto T3D_PageLoad; }
+@NoReturn
+command<18> T3DCmd_RdpqPrimColor(u32 a, u32 b) { goto T3D_PageLoad; }
+@NoReturn
+command<19> T3DCmd_RdpqScissor(u32 a, u32 b) { goto T3D_PageLoad; }
+
+/**
+ * Restores the vertex loading code in the paged window and the command table pointing
+ * to T3D_PageLoad. Preserves $a0-$a3.
+ */
+function T3D_WindowRestore()
+{
+  u32<$t3> savedRA = RA;
+  u32<$s0> rdram = load(UCODE_BUF_ADDR);
+  s16<$s4> dmem = CLIPPING_CODE_TARGET;
+  u16<$t0> size = T3D_WINDOW_SIZE - 1;
+  // offset of the window in the buffer, as a link-time constant (RSPL cannot subtract labels)
+  asm("addiu $s0, $s0, %lo(CLIPPING_CODE_TARGET - 0x1000 + T3D_BUF_TEXT_OFF)");
+  DMAInAsync(size, rdram, dmem);
+
+  rdram = load(UCODE_BUF_ADDR);
+  rdram += T3D_BUF_TABLES_OFF;
+  dmem = T3D_TABLES_DMEM;
+  size = T3D_TABLES_SIZE - 1;
+  RA = savedRA;
+  goto DMAIn;
+}
+
+/**
+ * Loads & transforms 3D vertices into the internal buffer (see T3DCmd_VertLoad_Impl).
+ * Restores the paged window first if something else is loaded.
+ */
+@NoReturn
+command<4> T3DCmd_VertLoad(u32 bufferSize, u32 rdramVerts, u32 addressInOut)
+{
+  u8 pageState = load(PAGE_STATE);
+  store(ZERO:u8, PAGE_STATE);
+  if(pageState) {
+    T3D_WindowRestore();
+    RA = RSPQ_Loop;
+  }
+  goto T3DCmd_VertLoad_Impl;
+}
+
+/**
+ * Entry point of the paged commands while the material page is not loaded: loads the page
+ * code, its data and the command table pointing into the page, then re-runs the command.
+ */
+@NoReturn
+function T3D_PageLoad()
+{
+  u32<$s0> rdram = load(UCODE_BUF_ADDR);
+  s16<$s4> dmem = CLIPPING_CODE_TARGET;
+  u16<$t0> size = T3D_WINDOW_SIZE - 1;
+  rdram += T3D_BUF_PAGE_OFF;
+  DMAInAsync(size, rdram, dmem);
+
+  // $s0 is preserved by the DMA functions, so the following offsets are relative
+  rdram += T3D_BUF_TABLES_PAGE_OFF - T3D_BUF_PAGE_OFF;
+  dmem = T3D_TABLES_DMEM;
+  size = T3D_TABLES_SIZE - 1;
+  DMAInAsync(size, rdram, dmem);
+
+  rdram += T3D_BUF_CONSTS_OFF - T3D_BUF_TABLES_PAGE_OFF;
+  dmem = CLIP_BUFFER_TMP;
+  size = T3D_PAGE_DATA_SIZE - 1;
+  DMAIn(size, rdram, dmem);
+
+  u8 pageState = T3D_PAGE_MATERIAL;
+  store(pageState, PAGE_STATE);
+
+  // re-run the command: rewind the queue pointer by its size ($t7, set by the rspq core)
+  asm("j RSPQ_Loop");
+  asm("subu $gp, $gp, $t7");
+}
+
+/**
  * Draws a triangle to the screen, if necessary also performs clipping.
  *
  * @param vert0 16-LSB contain DMEM address for the first vertex
  * @param vert1 LSB/MSB contain DMEM address for the second + third vertex
  */
+// The body only jumps to 'T3DCmd_TriDraw' (rspq_triangle.inc), so RSPL aliases the
+// command table entry to it and no code is emitted here.
 @NoReturn
 command<0> T3DCmd_TriDraw_Cmd(u32 vert0, u32 vert1)
 {
   goto T3DCmd_TriDraw;
+}
 
-  // (NOTE: moved to 'T3DCmd_TriDraw')
-    // Note: vert1 & vert2 are switched, this avoids an additional instruction here.
-    // We can't switch them on the CPU, as RDPQ_Triangle loads them from DMEM, so the order is different
-    //u32<$a2> vert2 = vert1 >> 16;
-    u32<$a2> vert2;
-
-
-  // (NOTE: moved to 'T3DCmd_TriDraw')
-    //u32<$v1> vertAddr = get_cmd_address(2); // where to load the vertex pointers from
-    //u32<$sp> rejectDest = RSPQ_Loop; // jump-target for rejected/culled tris
-    //u8<$v0> = load(FACE_CULLING); // face culling flag
-  // (NOTE: moved to 'RDPQ_Triangle_Send_Async')
-    // if a triangle was generated, change the offset to swap output-buffers
-    // the DMA is still active at this point, so we can only re-use it after a next send or sync
-    //     u16 currOffset = load(RDPQ_TRI_BUFF_OFFSET);
-    //     currOffset ^= RDP_CMD_MAX_SIZE; // note: overflows into the next buffer
-
-  RDPQ_Triangle_Clip:
-  // we need to clip now, first wait for any triangle still in flight
-  // this is necessary as clipping uses both buffers used as outputs
-  // Used: t0, t1
-  u32<$s4> targetImem; // this still contains the DMEM addr. of vertex indices, backup here (tri. strips)
+/**
+ * Called by the triangle code when a triangle needs clipping: waits for any triangle still
+ * in flight (clipping uses both output buffers), then jumps to the paged window, which
+ * loads the clipping code if needed (see CLIPPING_CODE_TARGET).
+ * @param targetImem still contains the DMEM addr. of the vertex indices, backed up here (tri. strips)
+ */
+@NoReturn
+function RDPQ_Triangle_Clip(u32<$s4> targetImem)
+{
   store(targetImem:u16, RSPQ_SCRATCH_MEM, 18);
   store(RA:u16, CLIP_RA);
   RDPQ_Triangle_Send_End(); // <- resets 'RDPQ_TRI_BUFF_OFFSET' to zero
 
-  // Now we need to perform clipping, the code for this is in a separate overlay.
-  // Check if already loaded, or load it in here otherwise.
-  // It will stay until the next tri-sync command (or if a different overlay is executed)
+  // The clipping code stays loaded until the next tri-sync (or a vertex load)
   targetImem = CLIPPING_CODE_TARGET;
   goto CLIPPING_CODE_TARGET;
 }
@@ -879,22 +958,17 @@ command<11> T3DCmd_TriDraw_Strip(u32 rdramAddr, u32 countDmem)
 /**
  * Syncs triangle calls, wrapper for 'RDPQ_Triangle_Send_Async'.
  */
+@NoReturn
 command<10> T3DCmd_TriSync()
 {
-  u8 clipLoaded = load(CLIP_CODE_ADDR);
-  u32<$s4> targetImem = CLIPPING_CODE_TARGET; // (delay-slot filler)
+  u8 pageState = load(PAGE_STATE);
+  store(ZERO:u8, PAGE_STATE);
 
-  // no clipping happened, just sync the triangle
-  if(!clipLoaded)goto RDPQ_Triangle_Send_End;
+  // nothing loaded over the window, just sync the triangle
+  if(!pageState)goto RDPQ_Triangle_Send_End;
 
-  u32<$s0> codeAddr = load(CLIP_CODE_ORG_ADDR);
-  u16<$t0> codeSize = load(CLIP_CODE_SIZE);
-
-  //printf("main: %x, s:%x -> %x\n", codeAddr, codeSize, targetImem);
-  dma_in_async(targetImem, codeAddr, codeSize); // RDPQ_Triangle_Send_End waits for DMA
-
+  T3D_WindowRestore();
   RA = RSPQ_Loop;
-  store(ZERO:u8, CLIP_CODE_ADDR); // mark as not loaded
   goto RDPQ_Triangle_Send_End;
 }
 
@@ -939,15 +1013,13 @@ command<12> T3DCmd_TriDraw_Seq(u32 sizeAndIndex, u16 endIndex)
     goto T3DCmd_TriSync;
 }
 
-command<13> T3DCmd_Patch(u32 rdramAddr_, u32 opcode0, u32 opcode1) {
-    u16<$t0> size = 8 - 1;
-    u32<$s0> rdramAddr = rdramAddr_;
-    s16<$s4> dmemAddr = RSPQ_SCRATCH_MEM;
-
-    store(opcode0, dmemAddr, 0);
-    store(opcode1, dmemAddr, 4);
-
-    DMAOut(size, rdramAddr, dmemAddr);
+/**
+ * Patches an 8-byte instruction pair in the RDRAM copy of this ucode and in IMEM.
+ * (implemented in the material page, see rsp_t3d_material.rspl)
+ */
+@NoReturn
+command<8> T3DCmd_Patch(u32 rdramAddr_, u32 opcode0, u32 opcode1, u32 imemAddr) {
+    goto T3D_PageLoad;
 }
 
 #endif

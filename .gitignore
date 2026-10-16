@@ -13,3 +13,4 @@ website/html
 *.pak
 docs/_*
 node_modules/
+examples-baseline/

@@ -373,6 +373,6 @@ macro emitClippedTri(u32 ptrWrite, u8 lastClipCode, vec32 lastPosUV, vec16 lastC
   store(lastPosUV.xyzw,    ptrWrite, VTX_ATTR_CLIPPOSi);
 }
 
-// insert dummy commands to make the data section match
+// insert dummy commands to make the data section match (same command count as the main overlay)
 command<0> Cmd_DummyStart(u32 vert0, u32 ptrVertB) {}
-command<12> Cmd_DummyEnd() {}
+command<20> Cmd_DummyEnd() {}

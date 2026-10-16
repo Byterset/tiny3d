@@ -19,7 +19,7 @@ Here is the current DMEM layout with the vertex buffer highlighted, each small b
 
 ![image info](./img/dmem_vert_buff.png)
 
-Currently, t3d has a cache-size of 70, so we have to somehow split out triangle draws to only reference any of the loaded 70 vertices.
+Currently, t3d has a cache-size of 69 (`T3D_VERTEX_CACHE_SIZE`), so we have to somehow split out triangle draws to only reference any of the loaded 69 vertices.
 On top, we should optimize these splits to use as little commands and memory as possible.<br>
 While both are interlinked, we take a look of the splitting part first now.
 
@@ -30,14 +30,14 @@ Here is an example visualization of the structure we want to build:<br>
 ![image info](./img/file_format.png)
 
 Note that this is the perspective of the file, so the data you see is in RDRAM.<br>
-Whereas e.g. the `t3d_vert_load(..., 0, 70)` is the offset/size of where to load it into the vertex cache.<br>
+Whereas e.g. the `t3d_vert_load(..., 0, 69)` is the offset/size of where to load it into the vertex cache.<br>
 The reason why there are strips is explained later.<br>
 (For more details on how the data is stored check out the file-format: [modelFormat.md](modelFormat.md))
 
 ## Splitting
 A naive solution would be to just iterate over the original index-buffer,
 check which vertices need to be loaded, and then draw triangles referencing them.<br>
-If you go above 70 vertices, you overwrite older vertices.<br>
+If you go above 69 vertices, you overwrite older vertices.<br>
 
 This approach does have a big issue though: Vertices are effectively random from the index buffers view,<br>
 so we would need a lot of smaller vertex loads over time.<br>
@@ -58,7 +58,7 @@ In the end we will reconstruct a vertex/index buffer from it again.<br>
 A 'Part' is one vertex load commands + all triangles that can be drawn with it.<br>
 
 To create it, we "emit" a triangle into it by writing out it's vertices (if not already there), and then take the index from that buffer as our 3 indices for the triangle.<br>
-Note that the vertex buffer is local to the part, so it can contain only 70 vertices.<br>
+Note that the vertex buffer is local to the part, so it can contain only 69 vertices.<br>
 
 We start this by emitting the first triangle, which will write 3 new vertices into the empty buffer.<br>
 Each time a triangle is emitted, we check if there are any other triangles that could be emitted too without needing new vertices.<br>
